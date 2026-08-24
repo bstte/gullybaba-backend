@@ -1,0 +1,9 @@
+CREATE TABLE IF NOT EXISTS gb_wc_order_tax_lookup (
+  order_id BIGINT NOT NULL,
+  tax_rate_id BIGINT NOT NULL,
+  date_created TIMESTAMP NOT NULL DEFAULT '1970-01-01 00:00:00',
+  shipping_tax DOUBLE PRECISION NOT NULL DEFAULT 0,
+  order_tax DOUBLE PRECISION NOT NULL DEFAULT 0,
+  total_tax DOUBLE PRECISION NOT NULL DEFAULT 0,
+  PRIMARY KEY (order_id, tax_rate_id)
+);
