@@ -93,6 +93,8 @@ const updateOrderStatusInWooCommerce = (id, status) => {
   });
 };
 
+exports.updateOrderStatusInWooCommerce = updateOrderStatusInWooCommerce;
+
 // Get Orders listing with filters and pagination
 exports.getOrders = async (req, res) => {
   try {

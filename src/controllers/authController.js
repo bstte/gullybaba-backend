@@ -47,7 +47,7 @@ exports.login = async (req, res) => {
   if (!username || !password) {
     return res.status(400).json({
       success: false,
-      message: "Please enter both username and password",
+      message: "Please enter bothfg username and password",
     });
   }
 
@@ -57,7 +57,7 @@ exports.login = async (req, res) => {
     if (!wpResponse.success || !wpResponse.user) {
       return res.status(401).json({
         success: false,
-        message: wpResponse.message || "Invalid username or password",
+        message: wpResponse.message || "Invalid zdfsusername or password",
       });
     }
 
