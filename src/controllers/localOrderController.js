@@ -32,6 +32,428 @@ const fetchProductImages = (productIds) => {
   });
 };
 
+// Minimal GET-JSON helper against the live WooCommerce site (basic-auth bypass + query-string keys)
+const wcGetJson = (url) => {
+  return new Promise((resolve) => {
+    https.get(url, { headers: { "Authorization": getBasicAuthHeader() } }, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode !== 200) return resolve(null);
+          resolve(JSON.parse(data));
+        } catch {
+          resolve(null);
+        }
+      });
+    }).on("error", () => resolve(null));
+  });
+};
+
+const ALLOWED_WEIGHT_CATEGORIES = ["ignou-help-books", "ignou-cbcs-help-books", "ignou-combos"];
+const ALLOWED_ASSIGNMENT_CATEGORIES = ["ignou-solved-assignments", "ignou-cbcs-solved-assignments"];
+
+// Best-effort code -> full-name maps standing in for WC()->countries / WC()->countries->get_states().
+// Only India is filled in (this storefront ships domestically); anything else falls back to the raw
+// code and raises a warning, since we don't have WooCommerce's full country/state list available here.
+const COUNTRY_NAMES = { IN: "India" };
+const INDIA_STATE_NAMES = {
+  AN: "Andaman and Nicobar Islands", AP: "Andhra Pradesh", AR: "Arunachal Pradesh", AS: "Assam",
+  BR: "Bihar", CH: "Chandigarh", CT: "Chhattisgarh", DN: "Dadra and Nagar Haveli and Daman and Diu",
+  DL: "Delhi", GA: "Goa", GJ: "Gujarat", HR: "Haryana", HP: "Himachal Pradesh",
+  JK: "Jammu and Kashmir", JH: "Jharkhand", KA: "Karnataka", KL: "Kerala", LA: "Ladakh",
+  LD: "Lakshadweep", MP: "Madhya Pradesh", MH: "Maharashtra", MN: "Manipur", ML: "Meghalaya",
+  MZ: "Mizoram", NL: "Nagaland", OR: "Odisha", PY: "Puducherry", PB: "Punjab", RJ: "Rajasthan",
+  SK: "Sikkim", TN: "Tamil Nadu", TG: "Telangana", TR: "Tripura", UP: "Uttar Pradesh",
+  UT: "Uttarakhand", WB: "West Bengal",
+};
+
+const resolveCountryName = (code, warnings) => {
+  if (COUNTRY_NAMES[code]) return COUNTRY_NAMES[code];
+  warnings.push(`No name mapping for country code "${code}" — using the raw code.`);
+  return code;
+};
+
+const resolveStateName = (countryCode, stateCode, warnings) => {
+  if (countryCode === "IN" && INDIA_STATE_NAMES[stateCode]) return INDIA_STATE_NAMES[stateCode];
+  warnings.push(`No name mapping for state code "${stateCode}" (country "${countryCode}") — using the raw code.`);
+  return stateCode;
+};
+
+// Bulk-fetch parent products (categories, weight, type, meta_data/ACF fields) for a set of product ids
+const fetchProductsBulk = async (productIds) => {
+  const ids = [...new Set(productIds.filter(Boolean))];
+  if (ids.length === 0) return {};
+  const url = getApiUrl("products", { include: ids.join(","), per_page: ids.length });
+  const products = await wcGetJson(url);
+  const map = {};
+  (products || []).forEach((p) => { map[p.id] = p; });
+  return map;
+};
+
+// Fetch a single variation record (its own weight override, attributes) — no bulk endpoint across parents.
+// getApiUrl appends consumer_key/secret as query params on the base products/{id} URL, so /variations/{id}
+// has to be spliced in before the query string.
+const fetchVariation = async (parentId, variationId) => {
+  const base = getApiUrl("products", {}, parentId);
+  const [path, query] = base.split("?");
+  const variationUrl = `${path}/variations/${variationId}?${query}`;
+  return wcGetJson(variationUrl);
+};
+
+const productMetaValue = (product, key) => {
+  const entry = (product?.meta_data || []).find((m) => m.key === key);
+  return entry ? entry.value : null;
+};
+
+const orderItemMetaValue = (lineItem, key) => {
+  const entry = (lineItem.meta_data || []).find((m) => m.key === key);
+  return entry ? entry.value : null;
+};
+
+// Ports the WordPress "$total_weight" calculation (Weight (kg) field on the order page).
+// Returns { total_weight, warnings } — warnings lists line items we couldn't fully resolve.
+async function computeOrderWeight(order) {
+  const warnings = [];
+  const productIds = order.line_items.map((li) => li.product_id);
+  const productMap = await fetchProductsBulk(productIds);
+
+  let totalWeight = 0;
+
+  for (const li of order.line_items) {
+    const product = productMap[li.product_id];
+    if (!product) {
+      warnings.push(`Product #${li.product_id} (${li.name}) could not be fetched from WooCommerce — excluded from weight.`);
+      continue;
+    }
+
+    const categories = (product.categories || []).map((c) => c.slug);
+    const isAllowed = categories.some((c) => ALLOWED_WEIGHT_CATEGORIES.includes(c));
+    if (!isAllowed) continue; // matches PHP: category not in allowed list, skip silently
+
+    if (li.variation_id) {
+      const variation = await fetchVariation(li.product_id, li.variation_id);
+      if (!variation) {
+        warnings.push(`Variation #${li.variation_id} of product #${li.product_id} (${li.name}) could not be fetched — used parent weight as fallback.`);
+      }
+      const weight = parseFloat((variation && variation.weight) || product.weight || 0) + 0.015;
+      totalWeight += weight * li.quantity;
+    } else if (product.type === "simple") {
+      const weight = parseFloat(product.weight || 0) + 0.015;
+      totalWeight += weight * li.quantity;
+    } else if (product.type === "woosb") {
+      const bundleIdsRaw = productMetaValue(product, "woosb_ids");
+      if (!bundleIdsRaw) {
+        warnings.push(`Bundle product #${li.product_id} (${li.name}) has no "woosb_ids" meta — bundle weight NOT included (unverified field, no woosb order was available to confirm the real meta key/shape).`);
+        continue;
+      }
+      const bundleIds = bundleIdsRaw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+      const bundleMap = await fetchProductsBulk(bundleIds);
+      bundleIds.forEach((bid) => {
+        const bp = bundleMap[bid];
+        if (!bp) return;
+        const weight = parseFloat(bp.weight || 0) + 0.015;
+        totalWeight += weight * li.quantity;
+      });
+    } else {
+      warnings.push(`Product #${li.product_id} (${li.name}) has unhandled type "${product.type}" — excluded from weight.`);
+    }
+  }
+
+  return { total_weight: Number(totalWeight.toFixed(3)), warnings };
+}
+
+// Ports the WordPress send_order_to_tekipost() payload builder — NO external API calls are made here.
+async function buildTekipostPreview(order) {
+  const warnings = [];
+  const productIds = order.line_items.map((li) => li.product_id);
+  const productMap = await fetchProductsBulk(productIds);
+
+  let totalPages = 0;
+  let totalWeight = 0;
+  let totalQty = 0;
+  let excludedOrderValue = 0;
+  const getItems = [];
+
+  for (const li of order.line_items) {
+    const product = productMap[li.product_id];
+    if (!product) {
+      warnings.push(`Product #${li.product_id} (${li.name}) could not be fetched from WooCommerce — treated as excluded.`);
+      excludedOrderValue += parseFloat(li.total || 0);
+      continue;
+    }
+
+    const categories = (product.categories || []).map((c) => c.slug);
+    const isAllowed = categories.some((c) => ALLOWED_WEIGHT_CATEGORIES.includes(c));
+    if (!isAllowed) {
+      excludedOrderValue += parseFloat(li.total || 0);
+      continue;
+    }
+
+    const name = li.name;
+    const sku = li.sku;
+
+    if (li.variation_id) {
+      const variation = await fetchVariation(li.product_id, li.variation_id);
+      if (!variation) warnings.push(`Variation #${li.variation_id} of product #${li.product_id} (${li.name}) could not be fetched.`);
+
+      const languageRaw = orderItemMetaValue(li, "pa_languages");
+      if (!languageRaw) warnings.push(`Line item "${name}" has no "pa_languages" order-item meta — language/page-count lookup skipped.`);
+      const itemLanguage = languageRaw ? languageRaw.split("-")[0].toLowerCase() : null;
+
+      const pageCount = itemLanguage ? parseInt(productMetaValue(product, `pages_${itemLanguage}`), 10) || 0 : 0;
+      if (itemLanguage && !productMetaValue(product, `pages_${itemLanguage}`)) {
+        warnings.push(`Product #${li.product_id} has no "pages_${itemLanguage}" ACF field — page count treated as 0.`);
+      }
+
+      const weight = parseFloat((variation && variation.weight) || product.weight || 0) + 0.015;
+      totalPages += pageCount * li.quantity;
+      totalWeight += weight * li.quantity;
+      totalQty += li.quantity;
+
+      getItems.push({ sku_number: sku, product_name: name, product_quantity: li.quantity, product_value: li.total });
+    } else if (product.type === "simple") {
+      const languageRaw = orderItemMetaValue(li, "Medium");
+      if (!languageRaw) warnings.push(`Line item "${name}" has no "Medium" order-item meta — language/page-count lookup skipped.`);
+      const itemLanguage = languageRaw ? languageRaw.split("-")[0].toLowerCase() : null;
+
+      const pageCount = itemLanguage ? parseInt(productMetaValue(product, `pages_${itemLanguage}`), 10) || 0 : 0;
+      const weight = parseFloat(product.weight || 0) + 0.015;
+      totalPages += pageCount * li.quantity;
+      totalWeight += weight * li.quantity;
+      totalQty += li.quantity;
+
+      getItems.push({
+        sku_number: sku,
+        product_name: languageRaw ? `${name} - ${languageRaw}` : name,
+        product_quantity: li.quantity,
+        product_value: li.total,
+      });
+    } else if (product.type === "woosb") {
+      warnings.push(`Bundle product #${li.product_id} (${li.name}) — woosb bundle expansion is unverified (no woosb order available to confirm the "woosb_ids" meta shape); item skipped from weight/pages, but still listed.`);
+      getItems.push({ sku_number: sku, product_name: name, product_quantity: li.quantity, product_value: li.total });
+      totalQty += li.quantity;
+    } else {
+      warnings.push(`Product #${li.product_id} (${li.name}) has unhandled type "${product.type}".`);
+      getItems.push({ sku_number: sku, product_name: name, product_quantity: li.quantity, product_value: li.total });
+      totalQty += li.quantity;
+    }
+  }
+
+  const tekipostOrderValue = Math.max(0, parseFloat(order.total) - excludedOrderValue);
+  let height = (totalPages / 25) * 0.1;
+  if (height < 0.5) height = 0.5;
+
+  const method = (order.payment_method || "").toLowerCase();
+  const mod = method === "cod" ? "1" : "0";
+
+  const receiverState = order.billing.state
+    ? resolveStateName(order.billing.country, order.billing.state, warnings)
+    : "";
+  if (!order.billing.state) warnings.push("Billing state is empty — receiver_state will be blank.");
+
+  const payload = {
+    isorder: 1,
+    consignee_name: `${order.billing.first_name} ${order.billing.last_name}`.trim(),
+    mobile_no: order.billing.phone || "",
+    alternate_mobile_no: order.billing.phone || "",
+    email_id: order.billing.email || "",
+    receiver_address: [order.billing.address_1, order.billing.address_2].filter(Boolean).join(", "),
+    receiver_pincode: order.billing.postcode || "",
+    receiver_city: order.billing.city || "",
+    receiver_state: receiverState,
+    receiver_landmark: "",
+    customer_order_no: order.id,
+    order_type: mod,
+    product_quantity: totalQty,
+    cod_amount: method === "cod" ? tekipostOrderValue : 0,
+    physical_weight: Number(totalWeight.toFixed(3)),
+    product_length: 21,
+    product_width: 14,
+    product_height: Number(height.toFixed(3)),
+    hsn_number: "12e34",
+    order_value: tekipostOrderValue,
+    productdetatis: getItems,
+    sender_address_id: 142,
+    return_address_same_as_pickup_address: 142,
+    return_consignee_name: "Gullybaba Return",
+    return_mobile_no: "9350849407",
+    return_alternate_mobile_no: "9350849407",
+    return_address: "2525/193, First Floor, Tota Ram Bazar, Near Hanuman Temple, Tri Nagar, Onkar Nagar-A, 110035, Delhi, India",
+    return_pincode: "110035",
+    return_city: "Tri Nagar",
+    return_state: "Delhi",
+    return_landmark: "Tota Ram Bazar, Near Hanuman Temple",
+  };
+
+  if (getItems.length === 0) warnings.push("No valid items to send to TekiPost (all line items excluded by category).");
+
+  return { payload, warnings };
+}
+
+// Ports the WordPress send_order_to_shiprocket() payload builder — NO external API calls are made here.
+// The 'woosb' bundle branch and the "solved assignments" (allowedAssignmentCategoryData) branch are
+// best-effort ports: no order with those item types was available to verify against, so both raise a
+// warning instead of silently producing a wrong number. Everything else (variation/simple line items)
+// was verified against a real order.
+async function buildShiprocketPreview(order) {
+  const warnings = [];
+  const productIds = order.line_items.map((li) => li.product_id);
+  const productMap = await fetchProductsBulk(productIds);
+
+  let totalPages = 0;
+  let totalWeight = 0;
+  let height = 0;
+  let length = 21;
+  let breadth = 14;
+  const getItems = [];
+
+  for (const li of order.line_items) {
+    const product = productMap[li.product_id];
+    if (!product) {
+      warnings.push(`Product #${li.product_id} (${li.name}) could not be fetched from WooCommerce — excluded.`);
+      continue;
+    }
+
+    const categories = (product.categories || []).map((c) => c.slug);
+    const isAllowed = categories.some((c) => ALLOWED_WEIGHT_CATEGORIES.includes(c));
+    const isAssignment = categories.some((c) => ALLOWED_ASSIGNMENT_CATEGORIES.includes(c));
+
+    const sku = li.sku || "N/A";
+    let name = li.name;
+    let itemQuantity = li.quantity;
+    let productType = null;
+
+    if (isAllowed) {
+      if (li.variation_id) {
+        productType = "variation";
+        const languageRaw = orderItemMetaValue(li, "pa_languages");
+        if (!languageRaw) warnings.push(`Line item "${name}" has no "pa_languages" order-item meta — page count skipped.`);
+        const itemLanguage = languageRaw ? languageRaw.split("-")[0].toLowerCase() : null;
+        const pageCount = itemLanguage ? parseInt(productMetaValue(product, `pages_${itemLanguage}`), 10) || 0 : 0;
+
+        const variation = await fetchVariation(li.product_id, li.variation_id);
+        if (!variation) warnings.push(`Variation #${li.variation_id} of product #${li.product_id} (${li.name}) could not be fetched — used parent weight as fallback.`);
+
+        totalPages += pageCount * itemQuantity;
+        const weight = parseFloat((variation && variation.weight) || product.weight || 0) + 0.015;
+        totalWeight += weight * itemQuantity;
+        height = (totalPages / 25) * 0.1;
+      } else if (product.type === "simple") {
+        productType = "simple";
+        const languageRaw = orderItemMetaValue(li, "Medium");
+        if (!languageRaw) warnings.push(`Line item "${name}" has no "Medium" order-item meta — page count skipped.`);
+        const itemLanguage = languageRaw ? languageRaw.split("-")[0].toLowerCase() : null;
+        const pageCount = itemLanguage ? parseInt(productMetaValue(product, `pages_${itemLanguage}`), 10) || 0 : 0;
+
+        totalPages += pageCount * itemQuantity;
+        const weight = parseFloat(product.weight || 0) + 0.015;
+        totalWeight += weight * itemQuantity;
+        height = (totalPages / 25) * 0.1;
+        name = `${name} - ${languageRaw || ""}`.trim();
+      } else if (product.type === "woosb") {
+        productType = "woosb";
+        warnings.push(
+          `Bundle product #${li.product_id} (${li.name}) — woosb bundle expansion is unverified (no woosb order available to confirm the "woosb_ids" meta shape). The WordPress code also resets total pages/weight/height to just this bundle's items at this point (a quirk of the original code, ported as-is) — treat these numbers with caution.`
+        );
+        const bundleIdsRaw = productMetaValue(product, "woosb_ids");
+        sku_reset: {
+          if (!bundleIdsRaw) {
+            warnings.push(`Bundle product #${li.product_id} has no "woosb_ids" meta — bundle contents skipped, item still listed.`);
+            break sku_reset;
+          }
+          const bundleIds = bundleIdsRaw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+          const bundleMap = await fetchProductsBulk(bundleIds);
+          totalPages = 0;
+          totalWeight = 0;
+          height = 0;
+          itemQuantity = 0;
+          const languageRaw = orderItemMetaValue(li, "Medium");
+          const itemLanguage = languageRaw ? languageRaw.split("-")[0].toLowerCase() : null;
+          bundleIds.forEach((bid) => {
+            const bp = bundleMap[bid];
+            if (!bp) return;
+            const pageCount = itemLanguage ? parseInt(productMetaValue(bp, `pages_${itemLanguage}`), 10) || 0 : 0;
+            totalPages += pageCount * li.quantity;
+            const weight = parseFloat(bp.weight || 0) + 0.015;
+            totalWeight += weight * li.quantity;
+            itemQuantity = li.quantity;
+          });
+          height = (totalPages / 25) * 0.1;
+          name = languageRaw ? `${li.name} - ${languageRaw} (${sku})` : li.name;
+        }
+      }
+    } else if (isAssignment) {
+      // "Hard Copy Via Courier" is expected to be the value of the item's FIRST meta entry in the
+      // WordPress code ($item->get_meta_data()[0]) — unverified, no solved-assignment order to test.
+      const firstMetaValue = li.meta_data && li.meta_data[0] ? li.meta_data[0].value : null;
+      if (firstMetaValue !== "Hard Copy Via Courier") {
+        warnings.push(`Assignment item "${name}" skipped — first meta value was "${firstMetaValue}", not "Hard Copy Via Courier" (unverified check, ported as-is).`);
+      } else if (product.type === "variable") {
+        productType = "variable";
+        warnings.push(`Assignment item "${name}" — solved-assignment branch is unverified (no matching order to test against).`);
+        totalWeight += 0.55 * itemQuantity;
+        height += 2.54 * itemQuantity;
+        length += 29 * itemQuantity;
+        breadth += 21 * itemQuantity;
+      }
+    }
+
+    if (productType) {
+      getItems.push({
+        sku: sku.slice(0, 45),
+        units: itemQuantity,
+        selling_price: li.total,
+        name,
+      });
+    }
+  }
+
+  if (height < 0.5) height = 0.5;
+
+  const country = resolveCountryName(order.billing.country, warnings);
+  const state = order.billing.state ? resolveStateName(order.billing.country, order.billing.state, warnings) : "";
+
+  // WordPress's get_date_created()->date(...) returns the site's local time (Asia/Kolkata), not GMT —
+  // order.date_created here is stored as GMT, so convert explicitly rather than using server-local time.
+  const dateParts = new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Kolkata",
+    year: "numeric", month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false,
+  }).formatToParts(new Date(order.date_created));
+  const partValue = (type) => dateParts.find((p) => p.type === type)?.value;
+  const orderDate = `${partValue("year")}-${partValue("month")}-${partValue("day")} ${partValue("hour")}:${partValue("minute")}`;
+
+  const payload = {
+    order_id: `${order.id}_gb`,
+    order_date: orderDate,
+    order_items: getItems,
+    pickup_location: "Gullybaba",
+    billing_customer_name: order.billing.first_name || "",
+    billing_last_name: order.billing.last_name || "",
+    billing_address: [order.billing.address_1, order.billing.address_2].filter(Boolean).join(", "),
+    billing_city: order.billing.city || "",
+    billing_pincode: order.billing.postcode || "",
+    billing_state: state,
+    billing_country: country,
+    billing_email: (order.billing.email || "").replace(/\s/g, ""),
+    billing_phone: order.billing.phone || "",
+    shipping_is_billing: true,
+    name: `Order #${order.id}`,
+    units: 1,
+    length,
+    breadth,
+    height: Number(height.toFixed(3)),
+    weight: null, // overridden by the admin-entered weight input before sending, see previewShiprocket
+    selling_price: order.total,
+    payment_method: (order.payment_method || "").toLowerCase() !== "cod" ? "prepaid" : "cod",
+    sub_total: order.total,
+  };
+
+  if (getItems.length === 0) warnings.push("No valid items to send to Shiprocket (all line items excluded by category).");
+
+  return { payload, warnings };
+}
+
 // Meta keys already surfaced as dedicated line_item fields — excluded from the generic meta_data array
 const LINE_ITEM_CORE_KEYS = new Set([
   "_line_subtotal",
@@ -649,5 +1071,474 @@ exports.getLocalOrderById = async (req, res) => {
   } catch (error) {
     console.error(`Error fetching local order ${req.params.id}:`, error);
     res.status(500).json({ success: false, message: "Failed to fetch order from local database" });
+  }
+};
+
+// GET /api/orders/local/:id/weight — ported from the WordPress "Weight (kg)" calculation
+exports.getOrderWeight = async (req, res) => {
+  try {
+    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const [order] = await buildOrdersPayload(rows);
+    const { total_weight, warnings } = await computeOrderWeight(order);
+
+    console.log(`[tekipost] order #${order.id} computed weight: ${total_weight} kg`);
+    if (warnings.length) console.log(`[tekipost] order #${order.id} weight warnings:`, warnings);
+
+    res.json({ success: true, total_weight, warnings });
+  } catch (error) {
+    console.error(`Error computing weight for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to compute order weight" });
+  }
+};
+
+// POST /api/orders/local/:id/tekipost-preview — builds the TekiPost payload and logs it.
+// Does NOT call the TekiPost login/order-create API — see the commented-out block below for that.
+exports.previewTekipost = async (req, res) => {
+  try {
+    // Matches PHP: $shipweight = $_POST['total_weight']; must be provided and numeric > 0.
+    const totalWeight = req.body?.total_weight;
+    if (totalWeight === undefined || totalWeight === null || totalWeight === "") {
+      return res.status(400).json({ success: false, message: "Weight not provided." });
+    }
+    if (!Number.isFinite(Number(totalWeight)) || Number(totalWeight) <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid weight provided." });
+    }
+
+    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const [order] = await buildOrdersPayload(rows);
+
+    if (order.status === "failed") {
+      return res.status(400).json({ success: false, message: "Order status is failed." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ success: false, message: "Order status is cancelled." });
+    }
+
+    const { payload, warnings } = await buildTekipostPreview(order);
+    payload.physical_weight = Number(totalWeight); // admin-entered weight overrides the auto-computed one, per PHP
+
+    console.log(`[tekipost] order #${order.id} payload:`, JSON.stringify(payload, null, 2));
+    if (warnings.length) console.log(`[tekipost] order #${order.id} warnings:`, warnings);
+
+    // --- Actual TekiPost submission (kept commented out until this is verified) ---
+    // const loginBody = await new Promise((resolve, reject) => {
+    //   const loginPayload = new URLSearchParams({
+    //     email: "promotion@gullybaba.com",
+    //     password: "*&^Dot1936slas",
+    //   }).toString();
+    //   const req2 = https.request(
+    //     "https://app.tekipost.com/api-login",
+    //     { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" } },
+    //     (r) => {
+    //       let data = "";
+    //       r.on("data", (c) => (data += c));
+    //       r.on("end", () => resolve(data));
+    //     }
+    //   );
+    //   req2.on("error", reject);
+    //   req2.write(loginPayload);
+    //   req2.end();
+    // });
+    // const token = JSON.parse(loginBody)?.data?.token;
+    // if (!token) throw new Error("Failed to retrieve API token from TekiPost.");
+    //
+    // const orderBody = await new Promise((resolve, reject) => {
+    //   const req3 = https.request(
+    //     "https://app.tekipost.com/api-b2c-single-order",
+    //     { method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
+    //     (r) => {
+    //       let data = "";
+    //       r.on("data", (c) => (data += c));
+    //       r.on("end", () => resolve(data));
+    //     }
+    //   );
+    //   req3.on("error", reject);
+    //   req3.write(JSON.stringify(payload));
+    //   req3.end();
+    // });
+    // console.log(`[tekipost] order #${order.id} submit response:`, orderBody);
+
+    res.json({ success: true, payload, warnings });
+  } catch (error) {
+    console.error(`Error building TekiPost preview for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to build TekiPost preview" });
+  }
+};
+
+// POST /api/orders/local/:id/shiprocket-preview — builds the Shiprocket payload and logs it.
+// Does NOT call the Shiprocket login/order-create API — see the commented-out block below for that.
+exports.previewShiprocket = async (req, res) => {
+  try {
+    // Matches PHP: $shipweight = $_POST['total_weight']; must be provided and numeric > 0.
+    const totalWeight = req.body?.total_weight;
+    if (totalWeight === undefined || totalWeight === null || totalWeight === "") {
+      return res.status(400).json({ success: false, message: "Weight not provided." });
+    }
+    if (!Number.isFinite(Number(totalWeight)) || Number(totalWeight) <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid weight provided." });
+    }
+
+    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const [order] = await buildOrdersPayload(rows);
+
+    if (order.status === "failed") {
+      return res.status(400).json({ success: false, message: "Order status is failed." });
+    }
+
+    const { payload, warnings } = await buildShiprocketPreview(order);
+    payload.weight = Number(totalWeight); // admin-entered weight overrides the internally computed one, per PHP
+
+    console.log(`[shiprocket] order #${order.id} payload:`, JSON.stringify(payload, null, 2));
+    if (warnings.length) console.log(`[shiprocket] order #${order.id} warnings:`, warnings);
+
+    // --- Actual Shiprocket submission (kept commented out until this is verified) ---
+    // const loginBody = await new Promise((resolve, reject) => {
+    //   const req2 = https.request(
+    //     "https://apiv2.shiprocket.in/v1/external/auth/login",
+    //     { method: "POST", headers: { "Content-Type": "application/json" } },
+    //     (r) => {
+    //       let data = "";
+    //       r.on("data", (c) => (data += c));
+    //       r.on("end", () => resolve(data));
+    //     }
+    //   );
+    //   req2.on("error", reject);
+    //   req2.write(JSON.stringify({ email: "kids@gullybaba.com", password: "Test@123" }));
+    //   req2.end();
+    // });
+    // const token = JSON.parse(loginBody)?.token;
+    // if (!token) throw new Error("Failed to retrieve API token from Shiprocket.");
+    //
+    // const orderBody = await new Promise((resolve, reject) => {
+    //   const req3 = https.request(
+    //     "https://apiv2.shiprocket.in/v1/external/orders/create/adhoc",
+    //     { method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
+    //     (r) => {
+    //       let data = "";
+    //       r.on("data", (c) => (data += c));
+    //       r.on("end", () => resolve(data));
+    //     }
+    //   );
+    //   req3.on("error", reject);
+    //   req3.write(JSON.stringify(payload));
+    //   req3.end();
+    // });
+    // console.log(`[shiprocket] order #${order.id} submit response:`, orderBody);
+
+    res.json({ success: true, payload, warnings });
+  } catch (error) {
+    console.error(`Error building Shiprocket preview for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to build Shiprocket preview" });
+  }
+};
+
+// GET /api/orders/local/:id/tekipost-status — "Click to Get Current Status of tekipost Details".
+// Ports get_tekipost_token() + fetch_tekipost_tracking_details() + save_tekipost_tracking_to_order().
+exports.fetchTekipostStatus = async (req, res) => {
+  try {
+    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const [order] = await buildOrdersPayload(rows);
+
+    const getTekipostToken = () => new Promise((resolve) => {
+      const req2 = https.request(
+        "https://app.tekipost.com/api-login",
+        { method: "POST", headers: { "Content-Type": "application/json" } },
+        (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => {
+            try { resolve(JSON.parse(data)?.data?.token || null); } catch { resolve(null); }
+          });
+        }
+      );
+      req2.on("error", () => resolve(null));
+      req2.write(JSON.stringify({ email: "promotion@gullybaba.com", password: "*&^Dot1936slas" }));
+      req2.end();
+    });
+
+    const token = await getTekipostToken();
+    if (!token) throw new Error("Unable to authenticate with TekiPost.");
+
+    // Step 1: shipment detail -> AWB + courier name
+    const shipmentBody = await new Promise((resolve, reject) => {
+      const req3 = https.request(
+        "https://app.tekipost.com/api-order-shipment-detail",
+        { method: "POST", headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
+        (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => resolve(data));
+        }
+      );
+      req3.on("error", reject);
+      req3.write(JSON.stringify({ order_no: order.id }));
+      req3.end();
+    });
+    const shipmentData = JSON.parse(shipmentBody);
+    const awbNumber = shipmentData.tracking_number || "";
+    if (!awbNumber) throw new Error("No tracking number available.");
+
+    // Step 2: tracking detail by AWB -> latest status
+    const trackingBody = await new Promise((resolve, reject) => {
+      https.get(
+        `https://app.tekipost.com/api-tracking-details/${awbNumber}`,
+        { headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
+        (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => resolve(data));
+        }
+      ).on("error", reject);
+    });
+    const trackingData = JSON.parse(trackingBody);
+    const latestStatus = trackingData?.data?.status_name || "";
+
+    const trackingDetails = {
+      tracking_number: awbNumber,
+      courier_name: shipmentData.courier_name || "",
+      tracking_statuses: latestStatus,
+    };
+
+    // Save back to the order — mirrors $order->update_meta_data(...)->save() via the WC REST API.
+    await new Promise((resolve, reject) => {
+      const putUrl = getApiUrl("orders", {}, order.id);
+      const putReq = https.request(putUrl, { method: "PUT", headers: { "Authorization": getBasicAuthHeader(), "Content-Type": "application/json" } }, (r) => {
+        let data = ""; r.on("data", (c) => (data += c)); r.on("end", () => resolve(data));
+      });
+      putReq.on("error", reject);
+      putReq.write(JSON.stringify({ meta_data: [
+        { key: "_tekipost_awb", value: trackingDetails.tracking_number },
+        { key: "_tekipost_courier_name", value: trackingDetails.courier_name },
+        { key: "_tekipost_c_status", value: trackingDetails.tracking_statuses },
+      ] }));
+      putReq.end();
+    });
+
+    console.log(`[tekipost-status] order #${order.id} tracking details:`, trackingDetails);
+    return res.json({ success: true, ...trackingDetails });
+  } catch (error) {
+    console.error(`Error fetching TekiPost status for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: error.message || "Failed to fetch TekiPost status" });
+  }
+};
+
+// GET /api/orders/local/:id/shiprocket-status — "Click to Get Current Status of Shiprocket Details".
+// Ports the WordPress get_shiprocket_detail_button() + fetch_shiprocket_tracking_details() + save_shiprocket_tracking_to_order() flow.
+exports.fetchShiprocketStatus = async (req, res) => {
+  try {
+    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const [order] = await buildOrdersPayload(rows);
+
+    const getShiprocketToken = () => new Promise((resolve) => {
+      const req2 = https.request(
+        "https://apiv2.shiprocket.in/v1/external/auth/login",
+        { method: "POST", headers: { "Content-Type": "application/json" } },
+        (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => {
+            try { resolve(JSON.parse(data)?.token || null); } catch { resolve(null); }
+          });
+        }
+      );
+      req2.on("error", () => resolve(null));
+      req2.write(JSON.stringify({ email: "kids@gullybaba.com", password: "Test@123" }));
+      req2.end();
+    });
+
+    const token = await getShiprocketToken();
+    if (!token) throw new Error("Unable to authenticate with Shiprocket.");
+
+    // Step 1: order lookup by WooCommerce order id -> shipment (AWB + courier)
+    const orderBody = await new Promise((resolve, reject) => {
+      https.get(
+        `https://apiv2.shiprocket.in/v1/external/orders/show/${order.id}`,
+        { headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
+        (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => resolve(data));
+        }
+      ).on("error", reject);
+    });
+    const orderData = JSON.parse(orderBody);
+    const shipment = orderData?.data?.shipments?.[0] || {};
+    const awbCode = shipment.awb || "";
+    if (!awbCode) throw new Error("No AWB code available.");
+
+    // Step 2: track by AWB -> current status, pickup date, EDD
+    const trackBody = await new Promise((resolve, reject) => {
+      https.get(
+        `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awbCode}`,
+        { headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
+        (r) => {
+          let data = "";
+          r.on("data", (c) => (data += c));
+          r.on("end", () => resolve(data));
+        }
+      ).on("error", reject);
+    });
+    const trackData = JSON.parse(trackBody);
+    const shipmentTrack = trackData?.tracking_data?.shipment_track?.[0] || {};
+
+    const trackingDetails = {
+      awb_code: awbCode,
+      pickup_date: shipmentTrack.pickup_date || "",
+      current_status: shipmentTrack.current_status || "",
+      courier_name: shipment.courier || shipmentTrack.courier_name || "",
+      edd: shipmentTrack.edd || "",
+    };
+
+    // Save back to the order — mirrors $order->update_meta_data(...)->save() via the WC REST API.
+    await new Promise((resolve, reject) => {
+      const putUrl = getApiUrl("orders", {}, order.id);
+      const putReq = https.request(putUrl, { method: "PUT", headers: { "Authorization": getBasicAuthHeader(), "Content-Type": "application/json" } }, (r) => {
+        let data = ""; r.on("data", (c) => (data += c)); r.on("end", () => resolve(data));
+      });
+      putReq.on("error", reject);
+      putReq.write(JSON.stringify({ meta_data: [
+        { key: "_shiprocket_awb", value: trackingDetails.awb_code },
+        { key: "_shiprocket_pickup_date", value: trackingDetails.pickup_date },
+        { key: "_shiprocket_current_status", value: trackingDetails.current_status },
+        { key: "_shiprocket_courier_name", value: trackingDetails.courier_name },
+        { key: "_shiprocket_edd", value: trackingDetails.edd },
+      ] }));
+      putReq.end();
+    });
+
+    console.log(`[shiprocket-status] order #${order.id} tracking details:`, trackingDetails);
+    return res.json({ success: true, ...trackingDetails });
+  } catch (error) {
+    console.error(`Error fetching Shiprocket status for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: error.message || "Failed to fetch Shiprocket status" });
+  }
+};
+
+// GET /api/orders/local/:id/notes — order notes list.
+// Ports WooCommerce's order-notes metabox: rows in gb_comments with comment_type = 'order_note' and
+// comment_post_id = the order id, newest first. A note is "customer-visible" when it has an
+// is_customer_note = 1 row in gb_commentmeta (mirrors WC's wc_add_order_note()); notes without that
+// meta are private admin notes. Notes imported from WordPress have no commentmeta, so they render as
+// private notes here regardless of how WordPress displayed them.
+exports.getOrderNotes = async (req, res) => {
+  try {
+    const { rows: orderRows } = await pool.query(`SELECT id FROM gb_wc_orders WHERE id = $1 AND type = 'shop_order'`, [req.params.id]);
+    if (orderRows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const { rows } = await pool.query(
+      `SELECT c.comment_id, c.comment_author, c.comment_content, c.comment_date, c.user_id,
+              COALESCE(m.meta_value, '0') = '1' AS is_customer_note
+       FROM gb_comments c
+       LEFT JOIN gb_commentmeta m ON m.comment_id = c.comment_id AND m.meta_key = 'is_customer_note'
+       WHERE c.comment_post_id = $1 AND c.comment_type = 'order_note'
+       ORDER BY c.comment_date DESC, c.comment_id DESC`,
+      [req.params.id]
+    );
+
+    const notes = rows.map((r) => ({
+      id: Number(r.comment_id),
+      content: r.comment_content,
+      date: r.comment_date,
+      author: r.comment_author,
+      is_customer_note: r.is_customer_note,
+      is_system_note: Number(r.user_id) === 0 && r.comment_author === "WooCommerce",
+    }));
+
+    res.json({ success: true, notes });
+  } catch (error) {
+    console.error(`Error fetching order notes for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to fetch order notes" });
+  }
+};
+
+// POST /api/orders/local/:id/notes — add an order note. body: { content, note_type }
+// note_type is "customer" for "Note to customer", anything else (including "") is a private note.
+// Mirrors WC_Order::add_order_note(), including the is_customer_note commentmeta flag.
+exports.addOrderNote = async (req, res) => {
+  const { content, note_type } = req.body;
+
+  if (!content || !content.trim()) {
+    return res.status(400).json({ success: false, message: "Note content is required" });
+  }
+
+  try {
+    const { rows: orderRows } = await pool.query(`SELECT id FROM gb_wc_orders WHERE id = $1 AND type = 'shop_order'`, [req.params.id]);
+    if (orderRows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const isCustomerNote = note_type === "customer";
+    const author = req.user?.username || "Admin";
+    const userId = req.user?.id || 0;
+
+    const { rows } = await pool.query(
+      `INSERT INTO gb_comments
+         (comment_post_id, comment_author, comment_author_email, comment_author_url, comment_author_ip,
+          comment_date, comment_date_gmt, comment_content, comment_approved, comment_agent, comment_type,
+          comment_parent, user_id)
+       VALUES ($1, $2, '', '', '', NOW(), NOW(), $3, '1', '', 'order_note', 0, $4)
+       RETURNING comment_id, comment_author, comment_content, comment_date, user_id`,
+      [req.params.id, author, content.trim(), userId]
+    );
+    const note = rows[0];
+
+    if (isCustomerNote) {
+      await pool.query(
+        `INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`,
+        [note.comment_id]
+      );
+    }
+
+    res.json({
+      success: true,
+      note: {
+        id: Number(note.comment_id),
+        content: note.comment_content,
+        date: note.comment_date,
+        author: note.comment_author,
+        is_customer_note: isCustomerNote,
+        is_system_note: false,
+      },
+    });
+  } catch (error) {
+    console.error(`Error adding order note for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to add order note" });
+  }
+};
+
+// DELETE /api/orders/local/:id/notes/:noteId
+exports.deleteOrderNote = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `DELETE FROM gb_comments WHERE comment_id = $1 AND comment_post_id = $2 AND comment_type = 'order_note' RETURNING comment_id`,
+      [req.params.noteId, req.params.id]
+    );
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Note not found" });
+    }
+
+    await pool.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1`, [req.params.noteId]);
+
+    res.json({ success: true });
+  } catch (error) {
+    console.error(`Error deleting order note ${req.params.noteId} for order ${req.params.id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to delete order note" });
   }
 };

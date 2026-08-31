@@ -6,6 +6,14 @@ const authMiddleware = require("../middleware/auth");
 
 router.get("/local", authMiddleware, localOrderController.getLocalOrders);
 router.get("/local/:id", authMiddleware, localOrderController.getLocalOrderById);
+router.get("/local/:id/weight", authMiddleware, localOrderController.getOrderWeight);
+router.post("/local/:id/tekipost-preview", authMiddleware, localOrderController.previewTekipost);
+router.post("/local/:id/shiprocket-preview", authMiddleware, localOrderController.previewShiprocket);
+router.get("/local/:id/tekipost-status", authMiddleware, localOrderController.fetchTekipostStatus);
+router.get("/local/:id/shiprocket-status", authMiddleware, localOrderController.fetchShiprocketStatus);
+router.get("/local/:id/notes", authMiddleware, localOrderController.getOrderNotes);
+router.post("/local/:id/notes", authMiddleware, localOrderController.addOrderNote);
+router.delete("/local/:id/notes/:noteId", authMiddleware, localOrderController.deleteOrderNote);
 
 // Orders were previously served live from the WordPress/WooCommerce REST API.
 // Now served from the local PostgreSQL copy of the orders table instead.
