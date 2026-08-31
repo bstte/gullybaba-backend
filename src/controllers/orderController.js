@@ -43,8 +43,8 @@ const fetchOrdersFromWooCommerce = (queryParams) => {
   });
 };
 
-// Helper function to update order status in WooCommerce REST API
-const updateOrderStatusInWooCommerce = (id, status) => {
+// Helper function to PUT an arbitrary payload to a WooCommerce order (status, billing, shipping, ...)
+const updateOrderInWooCommerce = (id, payload) => {
   return new Promise((resolve, reject) => {
     // Build PUT request URL using centralized credentials
     const baseUrl = getApiUrl("orders").split('?')[0]; // base endpoint path
@@ -53,7 +53,7 @@ const updateOrderStatusInWooCommerce = (id, status) => {
 
     const parsedUrl = new URL(putUrl);
     const authHeader = getBasicAuthHeader();
-    const bodyData = JSON.stringify({ status });
+    const bodyData = JSON.stringify(payload);
 
     const options = {
       hostname: parsedUrl.hostname,
@@ -93,6 +93,10 @@ const updateOrderStatusInWooCommerce = (id, status) => {
   });
 };
 
+// Kept for backwards compatibility with existing callers
+const updateOrderStatusInWooCommerce = (id, status) => updateOrderInWooCommerce(id, { status });
+
+exports.updateOrderInWooCommerce = updateOrderInWooCommerce;
 exports.updateOrderStatusInWooCommerce = updateOrderStatusInWooCommerce;
 
 // Get Orders listing with filters and pagination

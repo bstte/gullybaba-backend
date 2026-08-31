@@ -1,5 +1,6 @@
 const https = require("https");
 const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
+const { fetchCustomerById } = require("../utils/wcCustomer");
 
 // Helper function to fetch customers directly from WooCommerce
 const fetchCustomersFromWooCommerce = (page, limit, search) => {
@@ -43,41 +44,6 @@ const fetchCustomersFromWooCommerce = (page, limit, search) => {
   });
 };
 
-// Helper function to fetch a single customer by ID from WooCommerce
-const fetchCustomerById = (id) => {
-  return new Promise((resolve, reject) => {
-    const url = getApiUrl("customers", {}, id);
-    const authHeader = getBasicAuthHeader();
-
-    const options = {
-      headers: {
-        "Authorization": authHeader
-      }
-    };
-
-    const req = https.get(url, options, (res) => {
-      let data = "";
-      res.on("data", (chunk) => {
-        data += chunk;
-      });
-      res.on("end", () => {
-        try {
-          if (res.statusCode !== 200) {
-            return reject(new Error(`WooCommerce API returned status ${res.statusCode}`));
-          }
-          resolve(JSON.parse(data));
-        } catch (err) {
-          reject(err);
-        }
-      });
-    });
-
-    req.on("error", (err) => {
-      reject(err);
-    });
-  });
-};
-
 exports.getUserById = async (req, res) => {
   try {
     const { id } = req.params;
@@ -97,6 +63,7 @@ exports.getUserById = async (req, res) => {
         shipping: customer.shipping || null,
         date_created: customer.date_created,
         avatar_url: customer.avatar_url || null,
+        meta_data: customer.meta_data || [],
       },
     });
   } catch (error) {

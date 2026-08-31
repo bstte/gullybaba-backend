@@ -1,6 +1,6 @@
 const https = require("https");
 const pool = require("../config/database");
-const { updateOrderStatusInWooCommerce } = require("./orderController");
+const { updateOrderStatusInWooCommerce, updateOrderInWooCommerce } = require("./orderController");
 const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
 
 // Fetch product thumbnail images from the live WooCommerce API, keyed by product id
@@ -824,6 +824,47 @@ exports.getStatusCounts = async (req, res) => {
   }
 };
 
+// GET /api/orders/months — distinct year-month combinations that actually have orders, newest
+// first, for the "Filter by Date" month dropdown on the orders list page.
+exports.getMonths = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT to_char(date_created_gmt, 'YYYYMM') AS value
+       FROM gb_wc_orders
+       WHERE type = 'shop_order' AND date_created_gmt IS NOT NULL
+       ORDER BY value DESC`
+    );
+    const months = rows.map((r) => {
+      const year = Number(r.value.slice(0, 4));
+      const monthIndex = Number(r.value.slice(4, 6)) - 1;
+      const label = new Date(year, monthIndex, 1).toLocaleString("en-US", { month: "long", year: "numeric" });
+      return { value: r.value, label };
+    });
+    res.json({ success: true, months });
+  } catch (error) {
+    console.error("Error fetching order months:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch order months" });
+  }
+};
+
+// GET /api/orders/categories — distinct product categories that actually appear on order line
+// items, for the Category Filter dropdown on the orders list page.
+exports.getCategories = async (req, res) => {
+  try {
+    const { rows } = await pool.query(
+      `SELECT DISTINCT im.meta_value AS category
+       FROM gb_woocommerce_order_itemmeta im
+       JOIN gb_woocommerce_order_items oi ON oi.order_item_id = im.order_item_id
+       WHERE oi.order_item_type = 'line_item' AND lower(im.meta_key) = 'category' AND im.meta_value <> ''
+       ORDER BY category`
+    );
+    res.json({ success: true, categories: rows.map((r) => r.category) });
+  } catch (error) {
+    console.error("Error fetching order categories:", error);
+    res.status(500).json({ success: false, message: "Failed to fetch order categories" });
+  }
+};
+
 // GET /api/orders?page=&limit=&search=&status=&start_date=&end_date=&category=&payment_method=
 exports.getOrders = async (req, res) => {
   try {
@@ -833,7 +874,10 @@ exports.getOrders = async (req, res) => {
     const status = req.query.status || "";
     const start_date = req.query.start_date || "";
     const end_date = req.query.end_date || "";
-    const category = (req.query.category || "").trim();
+    const categories = (req.query.category || "")
+      .split(",")
+      .map((c) => c.trim())
+      .filter(Boolean);
     const payment_method = req.query.payment_method || "";
 
     const conditions = ["o.type = 'shop_order'"];
@@ -847,8 +891,16 @@ exports.getOrders = async (req, res) => {
     }
 
     if (payment_method && payment_method !== "all") {
-      params.push(payment_method);
-      conditions.push(`o.payment_method = $${params.length}`);
+      // Only "cod" is a literal payment_method value; every other gateway (razorpay, cheque, ...)
+      // counts as "prepaid", matching the same cod/prepaid split used for Shiprocket/TekiPost.
+      if (payment_method === "cod") {
+        conditions.push(`lower(o.payment_method) = 'cod'`);
+      } else if (payment_method === "prepaid") {
+        conditions.push(`(o.payment_method IS NULL OR lower(o.payment_method) <> 'cod')`);
+      } else {
+        params.push(payment_method);
+        conditions.push(`o.payment_method = $${params.length}`);
+      }
     }
 
     if (start_date) {
@@ -869,14 +921,14 @@ exports.getOrders = async (req, res) => {
       );
     }
 
-    if (category) {
-      params.push(`%${category}%`);
+    if (categories.length > 0) {
+      params.push(categories);
       conditions.push(
         `EXISTS (
           SELECT 1 FROM gb_woocommerce_order_items oi
           JOIN gb_woocommerce_order_itemmeta im ON im.order_item_id = oi.order_item_id
           WHERE oi.order_id = o.id AND oi.order_item_type = 'line_item'
-            AND lower(im.meta_key) = 'category' AND im.meta_value ILIKE $${params.length}
+            AND lower(im.meta_key) = 'category' AND im.meta_value = ANY($${params.length})
         )`
       );
     }
@@ -922,6 +974,97 @@ exports.getOrders = async (req, res) => {
 // Keeps WordPress/WooCommerce and the local database in sync: the local row is updated inside
 // a transaction, then pushed to WooCommerce; if the WooCommerce call fails, the local change is
 // rolled back so neither side is ever left out of sync with the other.
+// POST /api/orders/create — webhook for WordPress to call when a new WooCommerce order is created,
+// so it lands in this local copy too. TEST/first version: writes only to gb_wc_orders (no addresses,
+// line items, or meta yet — those can be added the same way once this base row is confirmed working).
+// Upserts on `id` (the WooCommerce order/post ID) so a retried webhook call is safe to resend.
+//
+// Expected JSON body (all fields optional except "id"; anything omitted is stored as NULL):
+// {
+//   "id": 113637,                          // WooCommerce order ID — REQUIRED, must match WP's order/post ID
+//   "status": "wc-processing",             // WooCommerce order status, WITH the "wc-" prefix
+//   "currency": "INR",
+//   "type": "shop_order",                  // usually always "shop_order"
+//   "tax_amount": 0,
+//   "total_amount": 318.00,
+//   "customer_id": 98891,
+//   "billing_email": "customer@example.com",
+//   "date_created_gmt": "2026-08-31 12:00:00",   // GMT, "YYYY-MM-DD HH:mm:ss"
+//   "date_updated_gmt": "2026-08-31 12:00:00",
+//   "parent_order_id": 0,
+//   "payment_method": "cod",
+//   "payment_method_title": "Cash on Delivery",
+//   "transaction_id": "",
+//   "ip_address": "203.0.113.10",
+//   "user_agent": "Mozilla/5.0 ...",
+//   "customer_note": ""
+// }
+exports.createOrder = async (req, res) => {
+  const {
+    id,
+    status,
+    currency,
+    type,
+    tax_amount,
+    total_amount,
+    customer_id,
+    billing_email,
+    date_created_gmt,
+    date_updated_gmt,
+    parent_order_id,
+    payment_method,
+    payment_method_title,
+    transaction_id,
+    ip_address,
+    user_agent,
+    customer_note,
+  } = req.body || {};
+
+  if (!id) {
+    return res.status(400).json({ success: false, message: "id is required" });
+  }
+
+  try {
+    const { rows } = await pool.query(
+      `INSERT INTO gb_wc_orders (
+         id, status, currency, type, tax_amount, total_amount, customer_id, billing_email,
+         date_created_gmt, date_updated_gmt, parent_order_id, payment_method, payment_method_title,
+         transaction_id, ip_address, user_agent, customer_note
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)
+       ON CONFLICT (id) DO UPDATE SET
+         status = EXCLUDED.status,
+         currency = EXCLUDED.currency,
+         type = EXCLUDED.type,
+         tax_amount = EXCLUDED.tax_amount,
+         total_amount = EXCLUDED.total_amount,
+         customer_id = EXCLUDED.customer_id,
+         billing_email = EXCLUDED.billing_email,
+         date_created_gmt = EXCLUDED.date_created_gmt,
+         date_updated_gmt = EXCLUDED.date_updated_gmt,
+         parent_order_id = EXCLUDED.parent_order_id,
+         payment_method = EXCLUDED.payment_method,
+         payment_method_title = EXCLUDED.payment_method_title,
+         transaction_id = EXCLUDED.transaction_id,
+         ip_address = EXCLUDED.ip_address,
+         user_agent = EXCLUDED.user_agent,
+         customer_note = EXCLUDED.customer_note
+       RETURNING *`,
+      [
+        id, status || null, currency || null, type || "shop_order", tax_amount ?? null, total_amount ?? null,
+        customer_id ?? null, billing_email || null, date_created_gmt || null, date_updated_gmt || null,
+        parent_order_id ?? null, payment_method || null, payment_method_title || null, transaction_id || null,
+        ip_address || null, user_agent || null, customer_note || null,
+      ]
+    );
+
+    console.log(`[order-webhook] order #${id} saved to gb_wc_orders`);
+    res.json({ success: true, order: rows[0] });
+  } catch (error) {
+    console.error(`Error saving order ${id} from webhook:`, error);
+    res.status(500).json({ success: false, message: "Failed to save order" });
+  }
+};
+
 exports.updateStatus = async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
@@ -966,6 +1109,91 @@ exports.updateStatus = async (req, res) => {
     await client.query("ROLLBACK");
     console.error(`Error updating order status for ID ${id}:`, error);
     return res.status(500).json({ success: false, message: "Failed to update order status" });
+  } finally {
+    client.release();
+  }
+};
+
+const ADDRESS_FIELDS = ["first_name", "last_name", "company", "address_1", "address_2", "city", "state", "postcode", "country", "email", "phone"];
+
+// PUT /api/orders/:id/address
+// Same local-then-WooCommerce pattern as updateStatus: writes gb_wc_order_addresses inside a
+// transaction, pushes the same billing/shipping fields to WooCommerce, and rolls back the local
+// write if WooCommerce rejects it so both sides stay in sync.
+exports.updateAddress = async (req, res) => {
+  const { id } = req.params;
+  const { billing, shipping } = req.body;
+
+  if (!billing && !shipping) {
+    return res.status(400).json({ success: false, message: "billing and/or shipping is required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    const orderExists = await client.query(
+      `SELECT id FROM gb_wc_orders WHERE id = $1 AND type = 'shop_order'`,
+      [id]
+    );
+    if (orderExists.rows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    const upsertAddress = async (addressType, address) => {
+      const values = ADDRESS_FIELDS.map((field) => address[field] ?? "");
+
+      const updateRes = await client.query(
+        `UPDATE gb_wc_order_addresses SET
+           first_name = $1, last_name = $2, company = $3, address_1 = $4, address_2 = $5,
+           city = $6, state = $7, postcode = $8, country = $9, email = $10, phone = $11
+         WHERE order_id = $12 AND address_type = $13`,
+        [...values, id, addressType]
+      );
+
+      if (updateRes.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_order_addresses
+             (order_id, address_type, first_name, last_name, company, address_1, address_2, city, state, postcode, country, email, phone)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [id, addressType, ...values]
+        );
+      }
+    };
+
+    if (billing) {
+      await upsertAddress("billing", billing);
+      if (billing.email) {
+        await client.query(`UPDATE gb_wc_orders SET billing_email = $1 WHERE id = $2`, [billing.email, id]);
+      }
+    }
+    if (shipping) {
+      await upsertAddress("shipping", shipping);
+    }
+
+    const wcPayload = {};
+    if (billing) wcPayload.billing = billing;
+    if (shipping) wcPayload.shipping = shipping;
+
+    try {
+      await updateOrderInWooCommerce(id, wcPayload);
+    } catch (wcError) {
+      await client.query("ROLLBACK");
+      console.error(`Failed to update WooCommerce address for order ${id}:`, wcError);
+      return res.status(502).json({
+        success: false,
+        message: "Failed to update order address on WordPress/WooCommerce. No changes were saved.",
+      });
+    }
+
+    await client.query("COMMIT");
+
+    return res.json({ success: true, message: "Order address updated successfully" });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(`Error updating order address for ID ${id}:`, error);
+    return res.status(500).json({ success: false, message: "Failed to update order address" });
   } finally {
     client.release();
   }
@@ -1094,8 +1322,73 @@ exports.getOrderWeight = async (req, res) => {
   }
 };
 
-// POST /api/orders/local/:id/tekipost-preview — builds the TekiPost payload and logs it.
-// Does NOT call the TekiPost login/order-create API — see the commented-out block below for that.
+// Fires an HTTPS request and resolves with the status code plus the parsed JSON body
+// (or the raw text if the response wasn't valid JSON). Used by the TekiPost/Shiprocket
+// login + order-create calls below, where a non-2xx or unparsable response must be
+// surfaced as a real error instead of being swallowed as a silent "success".
+function httpJsonRequest(url, { method = "POST", headers = {}, body } = {}) {
+  return new Promise((resolve, reject) => {
+    const req = https.request(url, { method, headers }, (r) => {
+      let data = "";
+      r.on("data", (c) => (data += c));
+      r.on("end", () => {
+        let json = null;
+        try {
+          json = JSON.parse(data);
+        } catch {
+          // leave json as null; raw text is still returned below
+        }
+        resolve({ statusCode: r.statusCode, raw: data, json });
+      });
+    });
+    req.on("error", reject);
+    if (body !== undefined) req.write(body);
+    req.end();
+  });
+}
+
+// On a real successful send, WordPress's send_order_to_{shiprocket,tekipost}() marks the order
+// completed and saves a "<carrier>_status" = "Sent" post meta (which is what the "Not Sent" badge
+// on the order page reads). Mirrors that: updates the local copy, then pushes the same change to
+// WooCommerce so the two stay in sync — matching the existing status-update pattern.
+async function markOrderSentToCarrier(orderId, metaKey) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE gb_wc_orders SET status = 'wc-completed', date_updated_gmt = NOW() WHERE id = $1 AND type = 'shop_order'`,
+      [orderId]
+    );
+    const updateRes = await client.query(
+      `UPDATE gb_wc_orders_meta SET meta_value = 'Sent' WHERE order_id = $1 AND meta_key = $2`,
+      [orderId, metaKey]
+    );
+    if (updateRes.rowCount === 0) {
+      await client.query(
+        `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, 'Sent')`,
+        [orderId, metaKey]
+      );
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  try {
+    await updateOrderInWooCommerce(orderId, { status: "completed", meta_data: [{ key: metaKey, value: "Sent" }] });
+  } catch (error) {
+    // The local record is already marked sent (the shipment really was created) — a failure to also
+    // push the flag to WooCommerce shouldn't fail the whole request, just gets logged for visibility.
+    console.error(`Failed to sync "${metaKey}" = Sent to WooCommerce for order ${orderId}:`, error);
+  }
+}
+
+// POST /api/orders/local/:id/tekipost-preview — builds the TekiPost payload, logs it, and
+// actually submits it to TekiPost (login + create order). Returns the live submission result
+// so the frontend can show whether TekiPost really accepted the order.
 exports.previewTekipost = async (req, res) => {
   try {
     // Matches PHP: $shipweight = $_POST['total_weight']; must be provided and numeric > 0.
@@ -1123,56 +1416,72 @@ exports.previewTekipost = async (req, res) => {
     const { payload, warnings } = await buildTekipostPreview(order);
     payload.physical_weight = Number(totalWeight); // admin-entered weight overrides the auto-computed one, per PHP
 
-    console.log(`[tekipost] order #${order.id} payload:`, JSON.stringify(payload, null, 2));
-    if (warnings.length) console.log(`[tekipost] order #${order.id} warnings:`, warnings);
+    // console.log(`[tekipost] order #${order.id} payload:`, JSON.stringify(payload, null, 2));
+    // if (warnings.length) console.log(`[tekipost] order #${order.id} warnings:`, warnings);
 
-    // --- Actual TekiPost submission (kept commented out until this is verified) ---
-    // const loginBody = await new Promise((resolve, reject) => {
-    //   const loginPayload = new URLSearchParams({
-    //     email: "promotion@gullybaba.com",
-    //     password: "*&^Dot1936slas",
-    //   }).toString();
-    //   const req2 = https.request(
-    //     "https://app.tekipost.com/api-login",
-    //     { method: "POST", headers: { "Content-Type": "application/x-www-form-urlencoded" } },
-    //     (r) => {
-    //       let data = "";
-    //       r.on("data", (c) => (data += c));
-    //       r.on("end", () => resolve(data));
-    //     }
-    //   );
-    //   req2.on("error", reject);
-    //   req2.write(loginPayload);
-    //   req2.end();
-    // });
-    // const token = JSON.parse(loginBody)?.data?.token;
-    // if (!token) throw new Error("Failed to retrieve API token from TekiPost.");
-    //
-    // const orderBody = await new Promise((resolve, reject) => {
-    //   const req3 = https.request(
-    //     "https://app.tekipost.com/api-b2c-single-order",
-    //     { method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
-    //     (r) => {
-    //       let data = "";
-    //       r.on("data", (c) => (data += c));
-    //       r.on("end", () => resolve(data));
-    //     }
-    //   );
-    //   req3.on("error", reject);
-    //   req3.write(JSON.stringify(payload));
-    //   req3.end();
-    // });
-    // console.log(`[tekipost] order #${order.id} submit response:`, orderBody);
+    const loginRes = await httpJsonRequest("https://app.tekipost.com/api-login", {
+      headers: { "Content-Type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        email: "promotion@gullybaba.com",
+        password: "*&^Dot1936slas",
+      }).toString(),
+    });
+    const apiToken = loginRes.json?.data?.token;
+    if (!apiToken) {
+      console.error(`[tekipost] order #${order.id} login failed:`, loginRes.statusCode, loginRes.raw);
+      return res.status(502).json({
+        success: false,
+        message: "TekiPost login failed — could not retrieve API token.",
+        details: loginRes.json || loginRes.raw,
+      });
+    }
 
-    res.json({ success: true, payload, warnings });
+    const submitRes = await httpJsonRequest("https://app.tekipost.com/api-b2c-single-order", {
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiToken}` },
+      body: JSON.stringify(payload),
+    });
+    console.log(`[tekipost] order #${order.id} submit response (${submitRes.statusCode}):`, submitRes.raw);
+
+    if (!submitRes.json) {
+      return res.status(502).json({
+        success: false,
+        message: "TekiPost returned an unexpected (non-JSON) response.",
+        details: submitRes.raw,
+        payload,
+        warnings,
+      });
+    }
+
+    // Matches the WordPress branches exactly: CANCELED and a 422 validation error are both reported
+    // back as non-fatal messages (the order was still "handled", just not actually shipped); anything
+    // else with a non-2xx status is a real failure. Only the true success path marks the order Sent.
+    if (submitRes.json.status === "CANCELED") {
+      return res.json({ success: true, payload, warnings, message: "Order already Cancelled in TekiPost.", submission: submitRes.json });
+    }
+    if (submitRes.json.status_code === 422) {
+      return res.json({ success: true, payload, warnings, message: JSON.stringify(submitRes.json.errors || submitRes.json), submission: submitRes.json });
+    }
+    if (submitRes.statusCode < 200 || submitRes.statusCode >= 300) {
+      return res.status(502).json({
+        success: false,
+        message: submitRes.json.message || "TekiPost rejected the order.",
+        details: submitRes.json,
+        payload,
+        warnings,
+      });
+    }
+
+    await markOrderSentToCarrier(order.id, "tekipost_status");
+    res.json({ success: true, payload, warnings, message: "Order successfully sent to TekiPost.", submission: submitRes.json });
   } catch (error) {
-    console.error(`Error building TekiPost preview for order ${req.params.id}:`, error);
-    res.status(500).json({ success: false, message: "Failed to build TekiPost preview" });
+    console.error(`Error sending order ${req.params.id} to TekiPost:`, error);
+    res.status(500).json({ success: false, message: error.message || "Failed to send order to TekiPost" });
   }
 };
 
-// POST /api/orders/local/:id/shiprocket-preview — builds the Shiprocket payload and logs it.
-// Does NOT call the Shiprocket login/order-create API — see the commented-out block below for that.
+// POST /api/orders/local/:id/shiprocket-preview — builds the Shiprocket payload, logs it, and
+// actually submits it to Shiprocket (login + create order). Returns the live submission result
+// so the frontend can show whether Shiprocket really accepted the order.
 exports.previewShiprocket = async (req, res) => {
   try {
     // Matches PHP: $shipweight = $_POST['total_weight']; must be provided and numeric > 0.
@@ -1197,47 +1506,63 @@ exports.previewShiprocket = async (req, res) => {
     const { payload, warnings } = await buildShiprocketPreview(order);
     payload.weight = Number(totalWeight); // admin-entered weight overrides the internally computed one, per PHP
 
-    console.log(`[shiprocket] order #${order.id} payload:`, JSON.stringify(payload, null, 2));
-    if (warnings.length) console.log(`[shiprocket] order #${order.id} warnings:`, warnings);
+    // console.log(`[shiprocket] order #${order.id} payload:`, JSON.stringify(payload, null, 2));
+    // if (warnings.length) console.log(`[shiprocket] order #${order.id} warnings:`, warnings);
 
-    // --- Actual Shiprocket submission (kept commented out until this is verified) ---
-    // const loginBody = await new Promise((resolve, reject) => {
-    //   const req2 = https.request(
-    //     "https://apiv2.shiprocket.in/v1/external/auth/login",
-    //     { method: "POST", headers: { "Content-Type": "application/json" } },
-    //     (r) => {
-    //       let data = "";
-    //       r.on("data", (c) => (data += c));
-    //       r.on("end", () => resolve(data));
-    //     }
-    //   );
-    //   req2.on("error", reject);
-    //   req2.write(JSON.stringify({ email: "kids@gullybaba.com", password: "Test@123" }));
-    //   req2.end();
-    // });
-    // const token = JSON.parse(loginBody)?.token;
-    // if (!token) throw new Error("Failed to retrieve API token from Shiprocket.");
-    //
-    // const orderBody = await new Promise((resolve, reject) => {
-    //   const req3 = https.request(
-    //     "https://apiv2.shiprocket.in/v1/external/orders/create/adhoc",
-    //     { method: "POST", headers: { "Content-Type": "application/json", "Authorization": `Bearer ${token}` } },
-    //     (r) => {
-    //       let data = "";
-    //       r.on("data", (c) => (data += c));
-    //       r.on("end", () => resolve(data));
-    //     }
-    //   );
-    //   req3.on("error", reject);
-    //   req3.write(JSON.stringify(payload));
-    //   req3.end();
-    // });
-    // console.log(`[shiprocket] order #${order.id} submit response:`, orderBody);
+    const loginRes = await httpJsonRequest("https://apiv2.shiprocket.in/v1/external/auth/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "kids@gullybaba.com", password: "Test@123" }),
+    });
+    const apiToken = loginRes.json?.token;
+    if (!apiToken) {
+      console.error(`[shiprocket] order #${order.id} login failed:`, loginRes.statusCode, loginRes.raw);
+      return res.status(502).json({
+        success: false,
+        message: "Shiprocket login failed — could not retrieve API token.",
+        details: loginRes.json || loginRes.raw,
+      });
+    }
 
-    res.json({ success: true, payload, warnings });
+    const submitRes = await httpJsonRequest("https://apiv2.shiprocket.in/v1/external/orders/create/adhoc", {
+      headers: { "Content-Type": "application/json", "Authorization": `Bearer ${apiToken}` },
+      body: JSON.stringify(payload),
+    });
+    console.log(`[shiprocket] order #${order.id} submit response (${submitRes.statusCode}):`, submitRes.raw);
+
+    if (!submitRes.json) {
+      return res.status(502).json({
+        success: false,
+        message: "Shiprocket returned an unexpected (non-JSON) response.",
+        details: submitRes.raw,
+        payload,
+        warnings,
+      });
+    }
+
+    // Matches the WordPress branches exactly: CANCELED and a 422 validation error are both reported
+    // back as non-fatal messages (the order was still "handled", just not actually shipped); anything
+    // else with a non-2xx status is a real failure. Only the true success path marks the order Sent.
+    if (submitRes.json.status === "CANCELED") {
+      return res.json({ success: true, payload, warnings, message: "Order already Cancelled in Shiprocket.", submission: submitRes.json });
+    }
+    if (submitRes.json.status_code === 422) {
+      return res.json({ success: true, payload, warnings, message: JSON.stringify(submitRes.json.errors || submitRes.json), submission: submitRes.json });
+    }
+    if (submitRes.statusCode < 200 || submitRes.statusCode >= 300) {
+      return res.status(502).json({
+        success: false,
+        message: submitRes.json.message || "Shiprocket rejected the order.",
+        details: submitRes.json,
+        payload,
+        warnings,
+      });
+    }
+
+    await markOrderSentToCarrier(order.id, "shiprocket_status");
+    res.json({ success: true, payload, warnings, message: "Order successfully sent to Shiprocket.", submission: submitRes.json });
   } catch (error) {
-    console.error(`Error building Shiprocket preview for order ${req.params.id}:`, error);
-    res.status(500).json({ success: false, message: "Failed to build Shiprocket preview" });
+    console.error(`Error sending order ${req.params.id} to Shiprocket:`, error);
+    res.status(500).json({ success: false, message: error.message || "Failed to send order to Shiprocket" });
   }
 };
 
@@ -1251,63 +1576,40 @@ exports.fetchTekipostStatus = async (req, res) => {
     }
     const [order] = await buildOrdersPayload(rows);
 
-    const getTekipostToken = () => new Promise((resolve) => {
-      const req2 = https.request(
-        "https://app.tekipost.com/api-login",
-        { method: "POST", headers: { "Content-Type": "application/json" } },
-        (r) => {
-          let data = "";
-          r.on("data", (c) => (data += c));
-          r.on("end", () => {
-            try { resolve(JSON.parse(data)?.data?.token || null); } catch { resolve(null); }
-          });
-        }
-      );
-      req2.on("error", () => resolve(null));
-      req2.write(JSON.stringify({ email: "promotion@gullybaba.com", password: "*&^Dot1936slas" }));
-      req2.end();
+    const loginRes = await httpJsonRequest("https://app.tekipost.com/api-login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "promotion@gullybaba.com", password: "*&^Dot1936slas" }),
     });
-
-    const token = await getTekipostToken();
+    const token = loginRes.json?.data?.token;
     if (!token) throw new Error("Unable to authenticate with TekiPost.");
 
     // Step 1: shipment detail -> AWB + courier name
-    const shipmentBody = await new Promise((resolve, reject) => {
-      const req3 = https.request(
-        "https://app.tekipost.com/api-order-shipment-detail",
-        { method: "POST", headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
-        (r) => {
-          let data = "";
-          r.on("data", (c) => (data += c));
-          r.on("end", () => resolve(data));
-        }
-      );
-      req3.on("error", reject);
-      req3.write(JSON.stringify({ order_no: order.id }));
-      req3.end();
+    const shipmentRes = await httpJsonRequest("https://app.tekipost.com/api-order-shipment-detail", {
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      body: JSON.stringify({ order_no: order.id }),
     });
-    const shipmentData = JSON.parse(shipmentBody);
-    const awbNumber = shipmentData.tracking_number || "";
-    if (!awbNumber) throw new Error("No tracking number available.");
+    if (!shipmentRes.json) {
+      console.error(`[tekipost-status] order #${order.id} non-JSON shipment-detail response:`, shipmentRes.statusCode, shipmentRes.raw);
+      throw new Error("TekiPost returned an unexpected response for shipment detail.");
+    }
+    const awbNumber = shipmentRes.json.tracking_number || "";
+    if (!awbNumber) {
+      // Expected right after an order is placed: TekiPost hasn't assigned an AWB/picked it up yet.
+      const err = new Error(shipmentRes.json.message || "No tracking number available yet — order is still pending pickup at TekiPost.");
+      err.statusCode = 409;
+      throw err;
+    }
 
     // Step 2: tracking detail by AWB -> latest status
-    const trackingBody = await new Promise((resolve, reject) => {
-      https.get(
-        `https://app.tekipost.com/api-tracking-details/${awbNumber}`,
-        { headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
-        (r) => {
-          let data = "";
-          r.on("data", (c) => (data += c));
-          r.on("end", () => resolve(data));
-        }
-      ).on("error", reject);
+    const trackingRes = await httpJsonRequest(`https://app.tekipost.com/api-tracking-details/${awbNumber}`, {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
     });
-    const trackingData = JSON.parse(trackingBody);
-    const latestStatus = trackingData?.data?.status_name || "";
+    const latestStatus = trackingRes.json?.data?.status_name || "";
 
     const trackingDetails = {
       tracking_number: awbNumber,
-      courier_name: shipmentData.courier_name || "",
+      courier_name: shipmentRes.json.courier_name || "",
       tracking_statuses: latestStatus,
     };
 
@@ -1330,7 +1632,7 @@ exports.fetchTekipostStatus = async (req, res) => {
     return res.json({ success: true, ...trackingDetails });
   } catch (error) {
     console.error(`Error fetching TekiPost status for order ${req.params.id}:`, error);
-    res.status(500).json({ success: false, message: error.message || "Failed to fetch TekiPost status" });
+    res.status(error.statusCode || 500).json({ success: false, message: error.message || "Failed to fetch TekiPost status" });
   }
 };
 
@@ -1344,57 +1646,37 @@ exports.fetchShiprocketStatus = async (req, res) => {
     }
     const [order] = await buildOrdersPayload(rows);
 
-    const getShiprocketToken = () => new Promise((resolve) => {
-      const req2 = https.request(
-        "https://apiv2.shiprocket.in/v1/external/auth/login",
-        { method: "POST", headers: { "Content-Type": "application/json" } },
-        (r) => {
-          let data = "";
-          r.on("data", (c) => (data += c));
-          r.on("end", () => {
-            try { resolve(JSON.parse(data)?.token || null); } catch { resolve(null); }
-          });
-        }
-      );
-      req2.on("error", () => resolve(null));
-      req2.write(JSON.stringify({ email: "kids@gullybaba.com", password: "Test@123" }));
-      req2.end();
+    const loginRes = await httpJsonRequest("https://apiv2.shiprocket.in/v1/external/auth/login", {
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ email: "kids@gullybaba.com", password: "Test@123" }),
     });
-
-    const token = await getShiprocketToken();
+    const token = loginRes.json?.token;
     if (!token) throw new Error("Unable to authenticate with Shiprocket.");
 
     // Step 1: order lookup by WooCommerce order id -> shipment (AWB + courier)
-    const orderBody = await new Promise((resolve, reject) => {
-      https.get(
-        `https://apiv2.shiprocket.in/v1/external/orders/show/${order.id}`,
-        { headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
-        (r) => {
-          let data = "";
-          r.on("data", (c) => (data += c));
-          r.on("end", () => resolve(data));
-        }
-      ).on("error", reject);
+    const orderRes = await httpJsonRequest(`https://apiv2.shiprocket.in/v1/external/orders/show/${order.id}`, {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
     });
-    const orderData = JSON.parse(orderBody);
-    const shipment = orderData?.data?.shipments?.[0] || {};
+    if (!orderRes.json) {
+      console.error(`[shiprocket-status] order #${order.id} non-JSON order lookup response:`, orderRes.statusCode, orderRes.raw);
+      throw new Error("Shiprocket returned an unexpected response for the order lookup.");
+    }
+    const shipment = orderRes.json?.data?.shipments?.[0] || {};
     const awbCode = shipment.awb || "";
-    if (!awbCode) throw new Error("No AWB code available.");
+    if (!awbCode) {
+      // Expected right after an order is placed: Shiprocket hasn't assigned an AWB/picked it up yet.
+      const err = new Error("No AWB code available yet — order is still pending pickup at Shiprocket.");
+      err.statusCode = 409;
+      throw err;
+    }
 
     // Step 2: track by AWB -> current status, pickup date, EDD
-    const trackBody = await new Promise((resolve, reject) => {
-      https.get(
-        `https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awbCode}`,
-        { headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" } },
-        (r) => {
-          let data = "";
-          r.on("data", (c) => (data += c));
-          r.on("end", () => resolve(data));
-        }
-      ).on("error", reject);
+    const trackRes = await httpJsonRequest(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awbCode}`, {
+      method: "GET",
+      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
     });
-    const trackData = JSON.parse(trackBody);
-    const shipmentTrack = trackData?.tracking_data?.shipment_track?.[0] || {};
+    const shipmentTrack = trackRes.json?.tracking_data?.shipment_track?.[0] || {};
 
     const trackingDetails = {
       awb_code: awbCode,
@@ -1425,7 +1707,7 @@ exports.fetchShiprocketStatus = async (req, res) => {
     return res.json({ success: true, ...trackingDetails });
   } catch (error) {
     console.error(`Error fetching Shiprocket status for order ${req.params.id}:`, error);
-    res.status(500).json({ success: false, message: error.message || "Failed to fetch Shiprocket status" });
+    res.status(error.statusCode || 500).json({ success: false, message: error.message || "Failed to fetch Shiprocket status" });
   }
 };
 
