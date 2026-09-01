@@ -55,6 +55,81 @@ const fetchAbandonedCartsFromWooCommerce = () => {
   });
 };
 
+// Helper function to update an abandoned cart's note via the same custom REST API
+const updateAbandonedCartNoteOnWordPress = (id, notes) => {
+  return new Promise((resolve, reject) => {
+    const url = new URL(getApiUrl("abandonedCarts", {}, id));
+    const authHeader = getBasicAuthHeader();
+    const payload = JSON.stringify({ notes });
+
+    const options = {
+      hostname: url.hostname,
+      path: `${url.pathname}${url.search}`,
+      method: "PUT",
+      headers: {
+        "Authorization": authHeader,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(payload)
+      }
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => {
+        data += chunk;
+      });
+      res.on("end", () => {
+        try {
+          if (res.statusCode < 200 || res.statusCode >= 300) {
+            return reject(new Error(`WordPress API returned status ${res.statusCode}: ${data}`));
+          }
+          resolve(JSON.parse(data));
+        } catch (err) {
+          reject(err);
+        }
+      });
+    });
+
+    req.on("error", (err) => {
+      reject(err);
+    });
+    req.write(payload);
+    req.end();
+  });
+};
+
+// Update Abandoned Cart Note
+exports.updateAbandonedCartNote = async (req, res) => {
+  try {
+    const { id } = req.params;
+    const { notes } = req.body;
+
+    if (typeof notes !== "string") {
+      return res.status(400).json({
+        success: false,
+        message: "notes field is required"
+      });
+    }
+
+    await updateAbandonedCartNoteOnWordPress(id, notes);
+
+    // Invalidate the cache so the next list fetch reflects the updated note
+    cartsCache.data = null;
+    cartsCache.timestamp = 0;
+
+    return res.json({
+      success: true,
+      message: "Note updated successfully"
+    });
+  } catch (error) {
+    console.error("Error updating abandoned cart note:", error);
+    return res.status(500).json({
+      success: false,
+      message: "Failed to update abandoned cart note"
+    });
+  }
+};
+
 // Get Abandoned Carts listing
 exports.getAbandonedCarts = async (req, res) => {
   try {
