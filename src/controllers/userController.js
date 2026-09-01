@@ -49,6 +49,14 @@ exports.getUserById = async (req, res) => {
     const { id } = req.params;
     const customer = await fetchCustomerById(id);
 
+    // WooCommerce ke customer object me "role" hamesha "customer" aata hai (WC customer
+    // resource me WP admin role ka concept hi nahi hai). Login ke waqt WordPress se mile
+    // asli roles JWT me store hote hain (req.user.roles), jab wahi logged-in user apna
+    // profile fetch kare to us se administrator role ko sahi se detect karte hain.
+    const isSelf = req.user && String(req.user.id) === String(id);
+    const wpRoles = isSelf && Array.isArray(req.user.roles) ? req.user.roles : null;
+    const role = wpRoles?.includes("administrator") ? "administrator" : (customer.role || "customer");
+
     return res.json({
       success: true,
       user: {
@@ -57,7 +65,7 @@ exports.getUserById = async (req, res) => {
         email: customer.email || null,
         first_name: customer.first_name || null,
         last_name: customer.last_name || null,
-        role: customer.role || "customer",
+        role,
         mobile: customer.billing ? customer.billing.phone : null,
         billing: customer.billing || null,
         shipping: customer.shipping || null,
