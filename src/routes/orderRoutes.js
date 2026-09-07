@@ -42,4 +42,11 @@ router.put("/:id/address", authMiddleware, checkOrdersAccess, checkEditUserDetai
 // secret (see middleware/checkWebhookSecret.js) instead of the admin-panel JWT.
 router.post("/create", checkWebhookSecret, localOrderController.createOrder);
 
+// Called FROM WordPress when an order note is added on its side (system note or wp-admin note).
+router.post("/:id/notes/sync", checkWebhookSecret, localOrderController.syncOrderNote);
+
+// Called FROM WordPress a couple minutes after order creation, once WooCommerce's own analytics
+// tables (coupon/product/tax lookup + stats) have finished computing in the background.
+router.post("/:id/analytics/sync", checkWebhookSecret, localOrderController.syncOrderAnalytics);
+
 module.exports = router;

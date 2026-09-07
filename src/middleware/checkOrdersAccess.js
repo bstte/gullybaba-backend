@@ -9,6 +9,11 @@ function requireOrderPermission(requiredValue, deniedMessage) {
   return async (req, res, next) => {
     try {
       const customer = await fetchCustomerById(req.user.id);
+
+      if (customer.role === "administrator") {
+        return next();
+      }
+
       const accessOrders = (customer.meta_data || []).find((m) => m.key === "access_orders");
       const values = Array.isArray(accessOrders?.value) ? accessOrders.value : [];
 

@@ -970,14 +970,18 @@ exports.getOrders = async (req, res) => {
   }
 };
 
+const ORDER_ADDRESS_FIELDS = ["first_name", "last_name", "company", "address_1", "address_2", "city", "state", "postcode", "country", "email", "phone"];
+
 // PUT /api/orders/:id/status
 // Keeps WordPress/WooCommerce and the local database in sync: the local row is updated inside
 // a transaction, then pushed to WooCommerce; if the WooCommerce call fails, the local change is
 // rolled back so neither side is ever left out of sync with the other.
 // POST /api/orders/create — webhook for WordPress to call when a new WooCommerce order is created,
-// so it lands in this local copy too. TEST/first version: writes only to gb_wc_orders (no addresses,
-// line items, or meta yet — those can be added the same way once this base row is confirmed working).
-// Upserts on `id` (the WooCommerce order/post ID) so a retried webhook call is safe to resend.
+// so it lands in this local copy too. Writes everything this app actually reads: gb_wc_orders,
+// gb_wc_orders_meta, gb_wc_order_addresses, gb_wc_order_operational_data, gb_woocommerce_order_items
+// and gb_woocommerce_order_itemmeta — all inside one transaction. Idempotent/resend-safe: the base
+// order row is upserted on `id`, and every child table is fully replaced (delete-then-insert) for
+// that order_id, so a retried webhook call never creates duplicates.
 //
 // Expected JSON body (all fields optional except "id"; anything omitted is stored as NULL):
 // {
@@ -997,7 +1001,42 @@ exports.getOrders = async (req, res) => {
 //   "transaction_id": "",
 //   "ip_address": "203.0.113.10",
 //   "user_agent": "Mozilla/5.0 ...",
-//   "customer_note": ""
+//   "customer_note": "",
+//   "meta": [ { "key": "_order_source", "value": "app" }, ... ],
+//   "addresses": {
+//     "billing":  { "first_name": "...", ..., "email": "...", "phone": "..." },
+//     "shipping": { "first_name": "...", ... }
+//   },
+//   "operational_data": {
+//     "created_via": "checkout", "woocommerce_version": "9.4.0", "prices_include_tax": false,
+//     "coupon_usages_are_counted": true, "download_permission_granted": true, "cart_hash": "...",
+//     "new_order_email_sent": true, "order_key": "wc_order_...", "order_stock_reduced": true,
+//     "date_paid_gmt": "2026-08-31 12:00:05", "date_completed_gmt": null,
+//     "shipping_tax_amount": 0, "shipping_total_amount": 0,
+//     "discount_tax_amount": 0, "discount_total_amount": 0, "recorded_sales": true
+//   },
+//   "items": [
+//     {
+//       "order_item_id": 4501,             // REQUIRED per item — must match WP's order_item_id
+//       "order_item_name": "IGNOU MBA Guide",
+//       "order_item_type": "line_item",    // line_item | shipping | tax | coupon | fee
+//       "meta": [ { "key": "_product_id", "value": "123" }, { "key": "_qty", "value": "1" }, ... ]
+//     }
+//   ],
+//   // Everything below is optional / best-effort — WooCommerce computes these analytics tables
+//   // asynchronously, so send them only if/when available; if omitted, nothing is written for them.
+//   "coupon_lookup": [ { "coupon_id": 12, "date_created": "...", "discount_amount": 50 } ],
+//   "product_lookup": [
+//     { "order_item_id": 4501, "product_id": 123, "variation_id": 0, "customer_id": 98891,
+//       "date_created": "...", "product_qty": 1, "product_net_revenue": 300, "product_gross_revenue": 318,
+//       "coupon_amount": 0, "tax_amount": 18, "shipping_amount": 0, "shipping_tax_amount": 0 }
+//   ],
+//   "tax_lookup": [ { "tax_rate_id": 1, "date_created": "...", "shipping_tax": 0, "order_tax": 18, "total_tax": 18 } ],
+//   "stats": {
+//     "parent_id": 0, "date_created": "...", "date_created_gmt": "...", "date_paid": "...",
+//     "date_completed": null, "num_items_sold": 1, "total_sales": 318, "tax_total": 18,
+//     "shipping_total": 0, "net_total": 300, "returning_customer": false
+//   }
 // }
 exports.createOrder = async (req, res) => {
   const {
@@ -1018,14 +1057,25 @@ exports.createOrder = async (req, res) => {
     ip_address,
     user_agent,
     customer_note,
+    meta,
+    addresses,
+    operational_data,
+    items,
+    coupon_lookup,
+    product_lookup,
+    tax_lookup,
+    stats,
   } = req.body || {};
 
   if (!id) {
     return res.status(400).json({ success: false, message: "id is required" });
   }
 
+  const client = await pool.connect();
   try {
-    const { rows } = await pool.query(
+    await client.query("BEGIN");
+
+    const { rows } = await client.query(
       `INSERT INTO gb_wc_orders (
          id, status, currency, type, tax_amount, total_amount, customer_id, billing_email,
          date_created_gmt, date_updated_gmt, parent_order_id, payment_method, payment_method_title,
@@ -1057,11 +1107,285 @@ exports.createOrder = async (req, res) => {
       ]
     );
 
-    console.log(`[order-webhook] order #${id} saved to gb_wc_orders`);
+    // gb_wc_orders_meta — full replace for this order_id
+    await client.query(`DELETE FROM gb_wc_orders_meta WHERE order_id = $1`, [id]);
+    if (Array.isArray(meta) && meta.length > 0) {
+      const values = [];
+      const placeholders = meta.map((m, i) => {
+        values.push(id, m.key ?? null, m.value ?? null);
+        const base = i * 3;
+        return `($${base + 1}, $${base + 2}, $${base + 3})`;
+      });
+      await client.query(
+        `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ${placeholders.join(", ")}`,
+        values
+      );
+    }
+
+    // gb_wc_order_addresses — full replace (billing + shipping) for this order_id
+    await client.query(`DELETE FROM gb_wc_order_addresses WHERE order_id = $1`, [id]);
+    if (addresses && typeof addresses === "object") {
+      for (const addressType of ["billing", "shipping"]) {
+        const address = addresses[addressType];
+        if (!address) continue;
+        const values = ORDER_ADDRESS_FIELDS.map((field) => address[field] ?? null);
+        await client.query(
+          `INSERT INTO gb_wc_order_addresses
+             (order_id, address_type, first_name, last_name, company, address_1, address_2, city, state, postcode, country, email, phone)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [id, addressType, ...values]
+        );
+      }
+    }
+
+    // gb_wc_order_operational_data — full replace for this order_id
+    await client.query(`DELETE FROM gb_wc_order_operational_data WHERE order_id = $1`, [id]);
+    if (operational_data && typeof operational_data === "object") {
+      const op = operational_data;
+      await client.query(
+        `INSERT INTO gb_wc_order_operational_data (
+           order_id, created_via, woocommerce_version, prices_include_tax, coupon_usages_are_counted,
+           download_permission_granted, cart_hash, new_order_email_sent, order_key, order_stock_reduced,
+           date_paid_gmt, date_completed_gmt, shipping_tax_amount, shipping_total_amount,
+           discount_tax_amount, discount_total_amount, recorded_sales
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
+        [
+          id, op.created_via ?? null, op.woocommerce_version ?? null, op.prices_include_tax ?? null,
+          op.coupon_usages_are_counted ?? null, op.download_permission_granted ?? null, op.cart_hash ?? null,
+          op.new_order_email_sent ?? null, op.order_key ?? null, op.order_stock_reduced ?? null,
+          op.date_paid_gmt ?? null, op.date_completed_gmt ?? null, op.shipping_tax_amount ?? null,
+          op.shipping_total_amount ?? null, op.discount_tax_amount ?? null, op.discount_total_amount ?? null,
+          op.recorded_sales ?? null,
+        ]
+      );
+    }
+
+    // gb_woocommerce_order_items + gb_woocommerce_order_itemmeta — full replace for this order_id.
+    // order_item_id is preserved as-is from WordPress (not auto-generated) so it stays the same
+    // identifier across both systems.
+    const existingItems = await client.query(
+      `SELECT order_item_id FROM gb_woocommerce_order_items WHERE order_id = $1`,
+      [id]
+    );
+    if (existingItems.rows.length > 0) {
+      const existingItemIds = existingItems.rows.map((r) => r.order_item_id);
+      await client.query(
+        `DELETE FROM gb_woocommerce_order_itemmeta WHERE order_item_id = ANY($1::bigint[])`,
+        [existingItemIds]
+      );
+    }
+    await client.query(`DELETE FROM gb_woocommerce_order_items WHERE order_id = $1`, [id]);
+
+    if (Array.isArray(items)) {
+      for (const item of items) {
+        if (!item.order_item_id) continue;
+        await client.query(
+          `INSERT INTO gb_woocommerce_order_items (order_item_id, order_item_name, order_item_type, order_id)
+           VALUES ($1, $2, $3, $4)`,
+          [item.order_item_id, item.order_item_name || "", item.order_item_type || "", id]
+        );
+
+        if (Array.isArray(item.meta) && item.meta.length > 0) {
+          const values = [];
+          const placeholders = item.meta.map((m, i) => {
+            values.push(item.order_item_id, m.key ?? null, m.value ?? null);
+            const base = i * 3;
+            return `($${base + 1}, $${base + 2}, $${base + 3})`;
+          });
+          await client.query(
+            `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value) VALUES ${placeholders.join(", ")}`,
+            values
+          );
+        }
+      }
+    }
+
+    // gb_wc_order_coupon_lookup — full replace for this order_id. Optional: WooCommerce computes
+    // this asynchronously, so WordPress may not have it ready yet when the order webhook fires —
+    // only written when the payload actually includes it, otherwise left untouched.
+    if (Array.isArray(coupon_lookup)) {
+      await client.query(`DELETE FROM gb_wc_order_coupon_lookup WHERE order_id = $1`, [id]);
+      for (const row of coupon_lookup) {
+        if (!row.coupon_id) continue;
+        await client.query(
+          `INSERT INTO gb_wc_order_coupon_lookup (order_id, coupon_id, date_created, discount_amount)
+           VALUES ($1, $2, $3, $4)`,
+          [id, row.coupon_id, row.date_created || null, row.discount_amount ?? 0]
+        );
+      }
+    }
+
+    // gb_wc_order_product_lookup — full replace for this order_id. Same optional/best-effort rule.
+    if (Array.isArray(product_lookup)) {
+      await client.query(`DELETE FROM gb_wc_order_product_lookup WHERE order_id = $1`, [id]);
+      for (const row of product_lookup) {
+        if (!row.order_item_id) continue;
+        await client.query(
+          `INSERT INTO gb_wc_order_product_lookup (
+             order_item_id, order_id, product_id, variation_id, customer_id, date_created, product_qty,
+             product_net_revenue, product_gross_revenue, coupon_amount, tax_amount, shipping_amount, shipping_tax_amount
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [
+            row.order_item_id, id, row.product_id ?? null, row.variation_id ?? 0, row.customer_id ?? null,
+            row.date_created || null, row.product_qty ?? 0, row.product_net_revenue ?? 0,
+            row.product_gross_revenue ?? 0, row.coupon_amount ?? 0, row.tax_amount ?? 0,
+            row.shipping_amount ?? 0, row.shipping_tax_amount ?? 0,
+          ]
+        );
+      }
+    }
+
+    // gb_wc_order_tax_lookup — full replace for this order_id. Same optional/best-effort rule.
+    if (Array.isArray(tax_lookup)) {
+      await client.query(`DELETE FROM gb_wc_order_tax_lookup WHERE order_id = $1`, [id]);
+      for (const row of tax_lookup) {
+        if (!row.tax_rate_id) continue;
+        await client.query(
+          `INSERT INTO gb_wc_order_tax_lookup (order_id, tax_rate_id, date_created, shipping_tax, order_tax, total_tax)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, row.tax_rate_id, row.date_created || null, row.shipping_tax ?? 0, row.order_tax ?? 0, row.total_tax ?? 0]
+        );
+      }
+    }
+
+    // gb_wc_order_stats — upsert (one row per order_id). Same optional/best-effort rule.
+    if (stats && typeof stats === "object") {
+      await client.query(
+        `INSERT INTO gb_wc_order_stats (
+           order_id, parent_id, date_created, date_created_gmt, date_paid, date_completed,
+           num_items_sold, total_sales, tax_total, shipping_total, net_total, returning_customer,
+           status, customer_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ON CONFLICT (order_id) DO UPDATE SET
+           parent_id = EXCLUDED.parent_id,
+           date_created = EXCLUDED.date_created,
+           date_created_gmt = EXCLUDED.date_created_gmt,
+           date_paid = EXCLUDED.date_paid,
+           date_completed = EXCLUDED.date_completed,
+           num_items_sold = EXCLUDED.num_items_sold,
+           total_sales = EXCLUDED.total_sales,
+           tax_total = EXCLUDED.tax_total,
+           shipping_total = EXCLUDED.shipping_total,
+           net_total = EXCLUDED.net_total,
+           returning_customer = EXCLUDED.returning_customer,
+           status = EXCLUDED.status,
+           customer_id = EXCLUDED.customer_id`,
+        [
+          id, stats.parent_id ?? 0, stats.date_created || null, stats.date_created_gmt || null,
+          stats.date_paid || null, stats.date_completed || null, stats.num_items_sold ?? 0,
+          stats.total_sales ?? 0, stats.tax_total ?? 0, stats.shipping_total ?? 0, stats.net_total ?? 0,
+          stats.returning_customer ?? null, status || null, customer_id ?? null,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+
+    console.log(`[order-webhook] order #${id} synced (order + meta + addresses + operational_data + ${Array.isArray(items) ? items.length : 0} items${Array.isArray(coupon_lookup) ? " + coupon_lookup" : ""}${Array.isArray(product_lookup) ? " + product_lookup" : ""}${Array.isArray(tax_lookup) ? " + tax_lookup" : ""}${stats ? " + stats" : ""})`);
     res.json({ success: true, order: rows[0] });
   } catch (error) {
+    await client.query("ROLLBACK");
     console.error(`Error saving order ${id} from webhook:`, error);
     res.status(500).json({ success: false, message: "Failed to save order" });
+  } finally {
+    client.release();
+  }
+};
+
+// POST /api/orders/:id/analytics/sync — webhook for WordPress to re-send just the 4 analytics
+// lookup tables (coupon_lookup, product_lookup, tax_lookup, stats) once WooCommerce has finished
+// computing them in the background (it writes these asynchronously via Action Scheduler, so they're
+// often not ready yet at order-creation time). Deliberately does NOT touch gb_wc_orders or any of
+// the other order tables — only whichever of these 4 optional fields are present in the body.
+exports.syncOrderAnalytics = async (req, res) => {
+  const { id } = req.params;
+  const { coupon_lookup, product_lookup, tax_lookup, stats } = req.body || {};
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    if (Array.isArray(coupon_lookup)) {
+      await client.query(`DELETE FROM gb_wc_order_coupon_lookup WHERE order_id = $1`, [id]);
+      for (const row of coupon_lookup) {
+        if (!row.coupon_id) continue;
+        await client.query(
+          `INSERT INTO gb_wc_order_coupon_lookup (order_id, coupon_id, date_created, discount_amount)
+           VALUES ($1, $2, $3, $4)`,
+          [id, row.coupon_id, row.date_created || null, row.discount_amount ?? 0]
+        );
+      }
+    }
+
+    if (Array.isArray(product_lookup)) {
+      await client.query(`DELETE FROM gb_wc_order_product_lookup WHERE order_id = $1`, [id]);
+      for (const row of product_lookup) {
+        if (!row.order_item_id) continue;
+        await client.query(
+          `INSERT INTO gb_wc_order_product_lookup (
+             order_item_id, order_id, product_id, variation_id, customer_id, date_created, product_qty,
+             product_net_revenue, product_gross_revenue, coupon_amount, tax_amount, shipping_amount, shipping_tax_amount
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [
+            row.order_item_id, id, row.product_id ?? null, row.variation_id ?? 0, row.customer_id ?? null,
+            row.date_created || null, row.product_qty ?? 0, row.product_net_revenue ?? 0,
+            row.product_gross_revenue ?? 0, row.coupon_amount ?? 0, row.tax_amount ?? 0,
+            row.shipping_amount ?? 0, row.shipping_tax_amount ?? 0,
+          ]
+        );
+      }
+    }
+
+    if (Array.isArray(tax_lookup)) {
+      await client.query(`DELETE FROM gb_wc_order_tax_lookup WHERE order_id = $1`, [id]);
+      for (const row of tax_lookup) {
+        if (!row.tax_rate_id) continue;
+        await client.query(
+          `INSERT INTO gb_wc_order_tax_lookup (order_id, tax_rate_id, date_created, shipping_tax, order_tax, total_tax)
+           VALUES ($1, $2, $3, $4, $5, $6)`,
+          [id, row.tax_rate_id, row.date_created || null, row.shipping_tax ?? 0, row.order_tax ?? 0, row.total_tax ?? 0]
+        );
+      }
+    }
+
+    if (stats && typeof stats === "object") {
+      await client.query(
+        `INSERT INTO gb_wc_order_stats (
+           order_id, parent_id, date_created, date_created_gmt, date_paid, date_completed,
+           num_items_sold, total_sales, tax_total, shipping_total, net_total, returning_customer,
+           status, customer_id
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+         ON CONFLICT (order_id) DO UPDATE SET
+           parent_id = EXCLUDED.parent_id,
+           date_created = EXCLUDED.date_created,
+           date_created_gmt = EXCLUDED.date_created_gmt,
+           date_paid = EXCLUDED.date_paid,
+           date_completed = EXCLUDED.date_completed,
+           num_items_sold = EXCLUDED.num_items_sold,
+           total_sales = EXCLUDED.total_sales,
+           tax_total = EXCLUDED.tax_total,
+           shipping_total = EXCLUDED.shipping_total,
+           net_total = EXCLUDED.net_total,
+           returning_customer = EXCLUDED.returning_customer,
+           status = EXCLUDED.status,
+           customer_id = EXCLUDED.customer_id`,
+        [
+          id, stats.parent_id ?? 0, stats.date_created || null, stats.date_created_gmt || null,
+          stats.date_paid || null, stats.date_completed || null, stats.num_items_sold ?? 0,
+          stats.total_sales ?? 0, stats.tax_total ?? 0, stats.shipping_total ?? 0, stats.net_total ?? 0,
+          stats.returning_customer ?? null, stats.status || null, stats.customer_id ?? null,
+        ]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(`Error syncing analytics tables for order ${id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to sync order analytics" });
+  } finally {
+    client.release();
   }
 };
 
@@ -1822,5 +2146,66 @@ exports.deleteOrderNote = async (req, res) => {
   } catch (error) {
     console.error(`Error deleting order note ${req.params.noteId} for order ${req.params.id}:`, error);
     res.status(500).json({ success: false, message: "Failed to delete order note" });
+  }
+};
+
+// POST /api/orders/:id/notes/sync — webhook for WordPress to call when an order note is added on
+// its side (a WooCommerce system note, e.g. a status-change note, or one added directly in wp-admin),
+// so it shows up in this local copy too. comment_id is preserved as-is from WordPress (not
+// auto-generated) and upserted, so a retried webhook call is safe to resend.
+//
+// Expected JSON body:
+// {
+//   "comment_id": 98765,                 // WordPress comment ID — REQUIRED
+//   "content": "Order status changed from Processing to Completed.",
+//   "author": "WooCommerce",
+//   "date_gmt": "2026-08-31 12:05:00",   // GMT, "YYYY-MM-DD HH:mm:ss"
+//   "user_id": 0,
+//   "is_customer_note": false
+// }
+exports.syncOrderNote = async (req, res) => {
+  const { id } = req.params;
+  const { comment_id, content, author, date_gmt, user_id, is_customer_note } = req.body || {};
+
+  if (!comment_id || !content) {
+    return res.status(400).json({ success: false, message: "comment_id and content are required" });
+  }
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    await client.query(
+      `INSERT INTO gb_comments
+         (comment_id, comment_post_id, comment_author, comment_author_email, comment_author_url,
+          comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_approved,
+          comment_agent, comment_type, comment_parent, user_id)
+       VALUES ($1, $2, $3, '', '', '', $4, $4, $5, '1', '', 'order_note', 0, $6)
+       ON CONFLICT (comment_id) DO UPDATE SET
+         comment_post_id = EXCLUDED.comment_post_id,
+         comment_author = EXCLUDED.comment_author,
+         comment_date = EXCLUDED.comment_date,
+         comment_date_gmt = EXCLUDED.comment_date_gmt,
+         comment_content = EXCLUDED.comment_content,
+         user_id = EXCLUDED.user_id`,
+      [comment_id, id, author || "WooCommerce", date_gmt || null, content, user_id ?? 0]
+    );
+
+    await client.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1 AND meta_key = 'is_customer_note'`, [comment_id]);
+    if (is_customer_note) {
+      await client.query(
+        `INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`,
+        [comment_id]
+      );
+    }
+
+    await client.query("COMMIT");
+    res.json({ success: true });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(`Error syncing order note ${comment_id} for order ${id}:`, error);
+    res.status(500).json({ success: false, message: "Failed to sync order note" });
+  } finally {
+    client.release();
   }
 };
