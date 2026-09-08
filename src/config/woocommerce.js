@@ -8,7 +8,8 @@ const endpoints = {
   products: "/wc/v2/products",
   coupons: "/wc/v3/coupons",
   blog: "/wp/v2/posts",
-  abandonedCarts: "/custom/v1/abandoned-carts"
+  abandonedCarts: "/custom/v1/abandoned-carts",
+  wcAbandonedCarts: "/custom/v1/wc-abandoned-carts"
 };
 
 // Helper function to build a complete API URL with keys appended
