@@ -1038,44 +1038,119 @@ const ORDER_ADDRESS_FIELDS = ["first_name", "last_name", "company", "address_1",
 //     "shipping_total": 0, "net_total": 300, "returning_customer": false
 //   }
 // }
+// Expected JSON body format:
+// Can be either the direct table schema OR standard WooCommerce order format (e.g. from $order->get_data()).
+// All WordPress IDs (order id, item id, product id, variation id, meta id, address id) are strictly preserved.
 exports.createOrder = async (req, res) => {
-  const {
-    id,
-    status,
-    currency,
-    type,
-    tax_amount,
-    total_amount,
-    customer_id,
-    billing_email,
-    date_created_gmt,
-    date_updated_gmt,
-    parent_order_id,
-    payment_method,
-    payment_method_title,
-    transaction_id,
-    ip_address,
-    user_agent,
-    customer_note,
-    meta,
-    addresses,
-    operational_data,
-    items,
-    coupon_lookup,
-    product_lookup,
-    tax_lookup,
-    stats,
-  } = req.body || {};
+  const body = req.body || {};
+  const orderId = body.id || body.order_id;
 
-  if (!id) {
-    return res.status(400).json({ success: false, message: "id is required" });
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: "Order id is required (must match WordPress order ID)" });
+  }
+
+  // Normalize order status (WooCommerce DB format uses "wc-" prefix, except core WordPress post statuses)
+  let rawStatus = body.status ? String(body.status).trim() : "wc-processing";
+  let status = rawStatus;
+  if (status && !status.startsWith("wc-") && !["trash", "auto-draft"].includes(status)) {
+    status = `wc-${status}`;
+  }
+
+  const currency = body.currency || "INR";
+  const type = body.type || "shop_order";
+  const tax_amount = body.tax_amount ?? body.total_tax ?? 0;
+  const total_amount = body.total_amount ?? body.total ?? 0;
+  const customer_id = body.customer_id ?? 0;
+  const billing_email = body.billing_email || body.billing?.email || body.addresses?.billing?.email || null;
+  const date_created_gmt = body.date_created_gmt || body.date_created || new Date().toISOString().slice(0, 19).replace("T", " ");
+  const date_updated_gmt = body.date_updated_gmt || body.date_modified_gmt || body.date_modified || date_created_gmt;
+  const parent_order_id = body.parent_order_id ?? body.parent_id ?? 0;
+  const payment_method = body.payment_method || null;
+  const payment_method_title = body.payment_method_title || null;
+  const transaction_id = body.transaction_id || null;
+  const ip_address = body.ip_address || body.customer_ip_address || null;
+  const user_agent = body.user_agent || body.customer_user_agent || null;
+  const customer_note = body.customer_note || null;
+
+  // Operational data normalization
+  const op = body.operational_data || {};
+  const opData = {
+    id: op.id ?? null,
+    created_via: op.created_via || body.created_via || "checkout",
+    woocommerce_version: op.woocommerce_version || body.version || null,
+    prices_include_tax: op.prices_include_tax ?? body.prices_include_tax ?? false,
+    coupon_usages_are_counted: op.coupon_usages_are_counted ?? true,
+    download_permission_granted: op.download_permission_granted ?? false,
+    cart_hash: op.cart_hash || body.cart_hash || null,
+    new_order_email_sent: op.new_order_email_sent ?? false,
+    order_key: op.order_key || body.order_key || null,
+    order_stock_reduced: op.order_stock_reduced ?? true,
+    date_paid_gmt: op.date_paid_gmt || body.date_paid_gmt || body.date_paid || null,
+    date_completed_gmt: op.date_completed_gmt || body.date_completed_gmt || body.date_completed || null,
+    shipping_tax_amount: op.shipping_tax_amount ?? body.shipping_tax ?? 0,
+    shipping_total_amount: op.shipping_total_amount ?? body.shipping_total ?? 0,
+    discount_tax_amount: op.discount_tax_amount ?? body.discount_tax ?? 0,
+    discount_total_amount: op.discount_total_amount ?? body.discount_total ?? 0,
+    recorded_sales: op.recorded_sales ?? true,
+  };
+
+  // Addresses normalization (supports body.addresses.billing or root body.billing)
+  const billingAddress = body.addresses?.billing || body.billing || null;
+  const shippingAddress = body.addresses?.shipping || body.shipping || null;
+
+  // Order items normalization (supports body.items or body.line_items + shipping_lines + fee_lines + coupon_lines)
+  let rawItems = [];
+  if (Array.isArray(body.items) && body.items.length > 0) {
+    rawItems = body.items;
+  } else {
+    if (Array.isArray(body.line_items)) {
+      body.line_items.forEach((li) => {
+        rawItems.push({
+          ...li,
+          order_item_id: li.order_item_id || li.id,
+          order_item_name: li.order_item_name || li.name,
+          order_item_type: "line_item",
+        });
+      });
+    }
+    if (Array.isArray(body.shipping_lines)) {
+      body.shipping_lines.forEach((sl) => {
+        rawItems.push({
+          ...sl,
+          order_item_id: sl.order_item_id || sl.id,
+          order_item_name: sl.order_item_name || sl.method_title || "Shipping",
+          order_item_type: "shipping",
+        });
+      });
+    }
+    if (Array.isArray(body.fee_lines)) {
+      body.fee_lines.forEach((fl) => {
+        rawItems.push({
+          ...fl,
+          order_item_id: fl.order_item_id || fl.id,
+          order_item_name: fl.order_item_name || fl.name || "Fee",
+          order_item_type: "fee",
+        });
+      });
+    }
+    if (Array.isArray(body.coupon_lines)) {
+      body.coupon_lines.forEach((cl) => {
+        rawItems.push({
+          ...cl,
+          order_item_id: cl.order_item_id || cl.id,
+          order_item_name: cl.order_item_name || cl.code || "Coupon",
+          order_item_type: "coupon",
+        });
+      });
+    }
   }
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
-    const { rows } = await client.query(
+    // 1. gb_wc_orders — Upsert main order row
+    const { rows: orderRows } = await client.query(
       `INSERT INTO gb_wc_orders (
          id, status, currency, type, tax_amount, total_amount, customer_id, billing_email,
          date_created_gmt, date_updated_gmt, parent_order_id, payment_method, payment_method_title,
@@ -1100,48 +1175,107 @@ exports.createOrder = async (req, res) => {
          customer_note = EXCLUDED.customer_note
        RETURNING *`,
       [
-        id, status || null, currency || null, type || "shop_order", tax_amount ?? null, total_amount ?? null,
-        customer_id ?? null, billing_email || null, date_created_gmt || null, date_updated_gmt || null,
-        parent_order_id ?? null, payment_method || null, payment_method_title || null, transaction_id || null,
-        ip_address || null, user_agent || null, customer_note || null,
+        orderId, status, currency, type, tax_amount, total_amount,
+        customer_id, billing_email, date_created_gmt, date_updated_gmt,
+        parent_order_id, payment_method, payment_method_title, transaction_id,
+        ip_address, user_agent, customer_note,
       ]
     );
 
-    // gb_wc_orders_meta — full replace for this order_id
-    await client.query(`DELETE FROM gb_wc_orders_meta WHERE order_id = $1`, [id]);
-    if (Array.isArray(meta) && meta.length > 0) {
-      const values = [];
-      const placeholders = meta.map((m, i) => {
-        values.push(id, m.key ?? null, m.value ?? null);
-        const base = i * 3;
-        return `($${base + 1}, $${base + 2}, $${base + 3})`;
-      });
-      await client.query(
-        `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ${placeholders.join(", ")}`,
-        values
-      );
+    // 2. gb_wc_orders_meta — Full replace for this order_id (preserves WP meta ID if provided)
+    await client.query(`DELETE FROM gb_wc_orders_meta WHERE order_id = $1`, [orderId]);
+    const rawMeta = Array.isArray(body.meta) ? body.meta : (Array.isArray(body.meta_data) ? body.meta_data : []);
+    if (rawMeta.length > 0) {
+      for (const m of rawMeta) {
+        const metaId = m.id || m.meta_id || null;
+        const metaKey = m.key ?? m.meta_key ?? null;
+        let metaVal = m.value !== undefined ? m.value : m.meta_value;
+        if (typeof metaVal === "object" && metaVal !== null) {
+          metaVal = JSON.stringify(metaVal);
+        } else if (metaVal !== null && metaVal !== undefined) {
+          metaVal = String(metaVal);
+        } else {
+          metaVal = null;
+        }
+
+        if (metaKey) {
+          if (metaId) {
+            await client.query(
+              `INSERT INTO gb_wc_orders_meta (id, order_id, meta_key, meta_value) VALUES ($1, $2, $3, $4)
+               ON CONFLICT (id) DO UPDATE SET meta_key = EXCLUDED.meta_key, meta_value = EXCLUDED.meta_value`,
+              [metaId, orderId, metaKey, metaVal]
+            );
+          } else {
+            await client.query(
+              `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+              [orderId, metaKey, metaVal]
+            );
+          }
+        }
+      }
     }
 
-    // gb_wc_order_addresses — full replace (billing + shipping) for this order_id
-    await client.query(`DELETE FROM gb_wc_order_addresses WHERE order_id = $1`, [id]);
-    if (addresses && typeof addresses === "object") {
-      for (const addressType of ["billing", "shipping"]) {
-        const address = addresses[addressType];
-        if (!address) continue;
-        const values = ORDER_ADDRESS_FIELDS.map((field) => address[field] ?? null);
+    // 3. gb_wc_order_addresses — Full replace (billing + shipping) for this order_id
+    await client.query(`DELETE FROM gb_wc_order_addresses WHERE order_id = $1`, [orderId]);
+    const addressPairs = [
+      { type: "billing", data: billingAddress },
+      { type: "shipping", data: shippingAddress },
+    ];
+    for (const { type: addrType, data: addr } of addressPairs) {
+      if (!addr || typeof addr !== "object") continue;
+      const addrId = addr.id || null;
+      const vals = ORDER_ADDRESS_FIELDS.map((f) => (addr[f] !== undefined ? addr[f] : null));
+      if (addrId) {
+        await client.query(
+          `INSERT INTO gb_wc_order_addresses
+             (id, order_id, address_type, first_name, last_name, company, address_1, address_2, city, state, postcode, country, email, phone)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+           ON CONFLICT (id) DO UPDATE SET
+             first_name = EXCLUDED.first_name, last_name = EXCLUDED.last_name, company = EXCLUDED.company,
+             address_1 = EXCLUDED.address_1, address_2 = EXCLUDED.address_2, city = EXCLUDED.city,
+             state = EXCLUDED.state, postcode = EXCLUDED.postcode, country = EXCLUDED.country,
+             email = EXCLUDED.email, phone = EXCLUDED.phone`,
+          [addrId, orderId, addrType, ...vals]
+        );
+      } else {
         await client.query(
           `INSERT INTO gb_wc_order_addresses
              (order_id, address_type, first_name, last_name, company, address_1, address_2, city, state, postcode, country, email, phone)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
-          [id, addressType, ...values]
+          [orderId, addrType, ...vals]
         );
       }
     }
 
-    // gb_wc_order_operational_data — full replace for this order_id
-    await client.query(`DELETE FROM gb_wc_order_operational_data WHERE order_id = $1`, [id]);
-    if (operational_data && typeof operational_data === "object") {
-      const op = operational_data;
+    // 4. gb_wc_order_operational_data — Full replace for this order_id
+    await client.query(`DELETE FROM gb_wc_order_operational_data WHERE order_id = $1`, [orderId]);
+    if (opData.id) {
+      await client.query(
+        `INSERT INTO gb_wc_order_operational_data (
+           id, order_id, created_via, woocommerce_version, prices_include_tax, coupon_usages_are_counted,
+           download_permission_granted, cart_hash, new_order_email_sent, order_key, order_stock_reduced,
+           date_paid_gmt, date_completed_gmt, shipping_tax_amount, shipping_total_amount,
+           discount_tax_amount, discount_total_amount, recorded_sales
+         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)
+         ON CONFLICT (id) DO UPDATE SET
+           created_via = EXCLUDED.created_via, woocommerce_version = EXCLUDED.woocommerce_version,
+           prices_include_tax = EXCLUDED.prices_include_tax, coupon_usages_are_counted = EXCLUDED.coupon_usages_are_counted,
+           download_permission_granted = EXCLUDED.download_permission_granted, cart_hash = EXCLUDED.cart_hash,
+           new_order_email_sent = EXCLUDED.new_order_email_sent, order_key = EXCLUDED.order_key,
+           order_stock_reduced = EXCLUDED.order_stock_reduced, date_paid_gmt = EXCLUDED.date_paid_gmt,
+           date_completed_gmt = EXCLUDED.date_completed_gmt, shipping_tax_amount = EXCLUDED.shipping_tax_amount,
+           shipping_total_amount = EXCLUDED.shipping_total_amount, discount_tax_amount = EXCLUDED.discount_tax_amount,
+           discount_total_amount = EXCLUDED.discount_total_amount, recorded_sales = EXCLUDED.recorded_sales`,
+        [
+          opData.id, orderId, opData.created_via, opData.woocommerce_version, opData.prices_include_tax,
+          opData.coupon_usages_are_counted, opData.download_permission_granted, opData.cart_hash,
+          opData.new_order_email_sent, opData.order_key, opData.order_stock_reduced,
+          opData.date_paid_gmt, opData.date_completed_gmt, opData.shipping_tax_amount,
+          opData.shipping_total_amount, opData.discount_tax_amount, opData.discount_total_amount,
+          opData.recorded_sales,
+        ]
+      );
+    } else {
       await client.query(
         `INSERT INTO gb_wc_order_operational_data (
            order_id, created_via, woocommerce_version, prices_include_tax, coupon_usages_are_counted,
@@ -1150,22 +1284,21 @@ exports.createOrder = async (req, res) => {
            discount_tax_amount, discount_total_amount, recorded_sales
          ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)`,
         [
-          id, op.created_via ?? null, op.woocommerce_version ?? null, op.prices_include_tax ?? null,
-          op.coupon_usages_are_counted ?? null, op.download_permission_granted ?? null, op.cart_hash ?? null,
-          op.new_order_email_sent ?? null, op.order_key ?? null, op.order_stock_reduced ?? null,
-          op.date_paid_gmt ?? null, op.date_completed_gmt ?? null, op.shipping_tax_amount ?? null,
-          op.shipping_total_amount ?? null, op.discount_tax_amount ?? null, op.discount_total_amount ?? null,
-          op.recorded_sales ?? null,
+          orderId, opData.created_via, opData.woocommerce_version, opData.prices_include_tax,
+          opData.coupon_usages_are_counted, opData.download_permission_granted, opData.cart_hash,
+          opData.new_order_email_sent, opData.order_key, opData.order_stock_reduced,
+          opData.date_paid_gmt, opData.date_completed_gmt, opData.shipping_tax_amount,
+          opData.shipping_total_amount, opData.discount_tax_amount, opData.discount_total_amount,
+          opData.recorded_sales,
         ]
       );
     }
 
-    // gb_woocommerce_order_items + gb_woocommerce_order_itemmeta — full replace for this order_id.
-    // order_item_id is preserved as-is from WordPress (not auto-generated) so it stays the same
-    // identifier across both systems.
+    // 9 & 10. gb_woocommerce_order_items + gb_woocommerce_order_itemmeta
+    // First clear existing itemmeta for any items of this order_id, then clear the order items
     const existingItems = await client.query(
       `SELECT order_item_id FROM gb_woocommerce_order_items WHERE order_id = $1`,
-      [id]
+      [orderId]
     );
     if (existingItems.rows.length > 0) {
       const existingItemIds = existingItems.rows.map((r) => r.order_item_id);
@@ -1174,119 +1307,303 @@ exports.createOrder = async (req, res) => {
         [existingItemIds]
       );
     }
-    await client.query(`DELETE FROM gb_woocommerce_order_items WHERE order_id = $1`, [id]);
+    await client.query(`DELETE FROM gb_woocommerce_order_items WHERE order_id = $1`, [orderId]);
 
-    if (Array.isArray(items)) {
-      for (const item of items) {
-        if (!item.order_item_id) continue;
-        await client.query(
-          `INSERT INTO gb_woocommerce_order_items (order_item_id, order_item_name, order_item_type, order_id)
-           VALUES ($1, $2, $3, $4)`,
-          [item.order_item_id, item.order_item_name || "", item.order_item_type || "", id]
-        );
+    const lineItemsForLookup = [];
+    let totalItemsSold = 0;
 
-        if (Array.isArray(item.meta) && item.meta.length > 0) {
-          const values = [];
-          const placeholders = item.meta.map((m, i) => {
-            values.push(item.order_item_id, m.key ?? null, m.value ?? null);
-            const base = i * 3;
-            return `($${base + 1}, $${base + 2}, $${base + 3})`;
-          });
-          await client.query(
-            `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value) VALUES ${placeholders.join(", ")}`,
-            values
-          );
+    for (const item of rawItems) {
+      const itemId = item.order_item_id || item.id;
+      if (!itemId) continue;
+
+      const itemName = item.order_item_name || item.name || item.method_title || item.code || "";
+      const itemType = item.order_item_type || item.type || (item.method_title ? "shipping" : item.code ? "coupon" : "line_item");
+
+      // Insert item row preserving exact WP order_item_id
+      await client.query(
+        `INSERT INTO gb_woocommerce_order_items (order_item_id, order_item_name, order_item_type, order_id)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (order_item_id) DO UPDATE SET
+           order_item_name = EXCLUDED.order_item_name,
+           order_item_type = EXCLUDED.order_item_type,
+           order_id = EXCLUDED.order_id`,
+        [itemId, itemName, itemType, orderId]
+      );
+
+      // Collect item metadata
+      const itemMetaList = Array.isArray(item.meta) ? [...item.meta] : (Array.isArray(item.meta_data) ? [...item.meta_data] : []);
+      const existingKeys = new Set(itemMetaList.map((m) => m.key || m.meta_key));
+
+      // Auto-inject core fields into meta if passed at top-level of item
+      if (itemType === "line_item") {
+        const prodId = item.product_id;
+        const varId = item.variation_id ?? 0;
+        const qty = item.quantity ?? item.product_qty ?? 1;
+        const subtotal = item.subtotal ?? item.total ?? 0;
+        const total = item.total ?? subtotal;
+        const subtotalTax = item.subtotal_tax ?? 0;
+        const lineTax = item.total_tax ?? item.tax_amount ?? 0;
+
+        if (prodId !== undefined && !existingKeys.has("_product_id")) itemMetaList.push({ key: "_product_id", value: String(prodId) });
+        if (varId !== undefined && !existingKeys.has("_variation_id")) itemMetaList.push({ key: "_variation_id", value: String(varId) });
+        if (qty !== undefined && !existingKeys.has("_qty")) itemMetaList.push({ key: "_qty", value: String(qty) });
+        if (subtotal !== undefined && !existingKeys.has("_line_subtotal")) itemMetaList.push({ key: "_line_subtotal", value: String(subtotal) });
+        if (total !== undefined && !existingKeys.has("_line_total")) itemMetaList.push({ key: "_line_total", value: String(total) });
+        if (subtotalTax !== undefined && !existingKeys.has("_line_subtotal_tax")) itemMetaList.push({ key: "_line_subtotal_tax", value: String(subtotalTax) });
+        if (lineTax !== undefined && !existingKeys.has("_line_tax")) itemMetaList.push({ key: "_line_tax", value: String(lineTax) });
+        if (item.tax_class !== undefined && !existingKeys.has("_tax_class")) itemMetaList.push({ key: "_tax_class", value: item.tax_class || "" });
+        if (item.sku && !existingKeys.has("Code")) itemMetaList.push({ key: "Code", value: item.sku });
+        if (item.category && !existingKeys.has("Category")) itemMetaList.push({ key: "Category", value: item.category });
+
+        totalItemsSold += Number(qty) || 1;
+        lineItemsForLookup.push({
+          order_item_id: itemId,
+          product_id: prodId,
+          variation_id: varId,
+          quantity: qty,
+          subtotal,
+          total,
+          tax: lineTax,
+        });
+      } else if (itemType === "shipping") {
+        if (item.method_id && !existingKeys.has("method_id")) itemMetaList.push({ key: "method_id", value: item.method_id });
+        if (item.instance_id && !existingKeys.has("instance_id")) itemMetaList.push({ key: "instance_id", value: item.instance_id });
+        if (item.total !== undefined && !existingKeys.has("cost")) itemMetaList.push({ key: "cost", value: String(item.total) });
+        if (item.total_tax !== undefined && !existingKeys.has("total_tax")) itemMetaList.push({ key: "total_tax", value: String(item.total_tax) });
+      } else if (itemType === "fee") {
+        if (item.amount !== undefined && !existingKeys.has("_fee_amount")) itemMetaList.push({ key: "_fee_amount", value: String(item.amount) });
+        if (item.total !== undefined && !existingKeys.has("_line_total")) itemMetaList.push({ key: "_line_total", value: String(item.total) });
+        if (item.total_tax !== undefined && !existingKeys.has("_line_tax")) itemMetaList.push({ key: "_line_tax", value: String(item.total_tax) });
+      } else if (itemType === "coupon") {
+        if (item.discount !== undefined && !existingKeys.has("discount_amount")) itemMetaList.push({ key: "discount_amount", value: String(item.discount) });
+        if (item.discount_tax !== undefined && !existingKeys.has("discount_amount_tax")) itemMetaList.push({ key: "discount_amount_tax", value: String(item.discount_tax) });
+      }
+
+      // Insert item metadata rows
+      for (const m of itemMetaList) {
+        const metaId = m.id || m.meta_id || null;
+        const metaKey = m.key ?? m.meta_key ?? null;
+        let metaVal = m.value !== undefined ? m.value : m.meta_value;
+        if (typeof metaVal === "object" && metaVal !== null) {
+          metaVal = JSON.stringify(metaVal);
+        } else if (metaVal !== null && metaVal !== undefined) {
+          metaVal = String(metaVal);
+        } else {
+          metaVal = null;
+        }
+
+        if (metaKey) {
+          if (metaId) {
+            await client.query(
+              `INSERT INTO gb_woocommerce_order_itemmeta (meta_id, order_item_id, meta_key, meta_value)
+               VALUES ($1, $2, $3, $4)
+               ON CONFLICT (meta_id) DO UPDATE SET meta_key = EXCLUDED.meta_key, meta_value = EXCLUDED.meta_value`,
+              [metaId, itemId, metaKey, metaVal]
+            );
+          } else {
+            await client.query(
+              `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+              [itemId, metaKey, metaVal]
+            );
+          }
         }
       }
     }
 
-    // gb_wc_order_coupon_lookup — full replace for this order_id. Optional: WooCommerce computes
-    // this asynchronously, so WordPress may not have it ready yet when the order webhook fires —
-    // only written when the payload actually includes it, otherwise left untouched.
-    if (Array.isArray(coupon_lookup)) {
-      await client.query(`DELETE FROM gb_wc_order_coupon_lookup WHERE order_id = $1`, [id]);
-      for (const row of coupon_lookup) {
-        if (!row.coupon_id) continue;
-        await client.query(
-          `INSERT INTO gb_wc_order_coupon_lookup (order_id, coupon_id, date_created, discount_amount)
-           VALUES ($1, $2, $3, $4)`,
-          [id, row.coupon_id, row.date_created || null, row.discount_amount ?? 0]
-        );
-      }
+    // 5. gb_wc_order_coupon_lookup — Full replace for this order_id
+    await client.query(`DELETE FROM gb_wc_order_coupon_lookup WHERE order_id = $1`, [orderId]);
+    const couponLookupData = Array.isArray(body.coupon_lookup)
+      ? body.coupon_lookup
+      : (Array.isArray(body.coupon_lines)
+          ? body.coupon_lines.map((cl) => ({
+              coupon_id: cl.coupon_id || cl.id,
+              date_created: cl.date_created || date_created_gmt,
+              discount_amount: cl.discount || cl.discount_amount || 0,
+            }))
+          : []);
+
+    for (const row of couponLookupData) {
+      if (!row.coupon_id) continue;
+      await client.query(
+        `INSERT INTO gb_wc_order_coupon_lookup (order_id, coupon_id, date_created, discount_amount)
+         VALUES ($1, $2, $3, $4)
+         ON CONFLICT (order_id, coupon_id) DO UPDATE SET
+           date_created = EXCLUDED.date_created,
+           discount_amount = EXCLUDED.discount_amount`,
+        [orderId, row.coupon_id, row.date_created || date_created_gmt, row.discount_amount ?? 0]
+      );
     }
 
-    // gb_wc_order_product_lookup — full replace for this order_id. Same optional/best-effort rule.
-    if (Array.isArray(product_lookup)) {
-      await client.query(`DELETE FROM gb_wc_order_product_lookup WHERE order_id = $1`, [id]);
-      for (const row of product_lookup) {
+    // 6. gb_wc_order_product_lookup — Full replace for this order_id
+    await client.query(`DELETE FROM gb_wc_order_product_lookup WHERE order_id = $1`, [orderId]);
+    if (Array.isArray(body.product_lookup) && body.product_lookup.length > 0) {
+      for (const row of body.product_lookup) {
         if (!row.order_item_id) continue;
         await client.query(
           `INSERT INTO gb_wc_order_product_lookup (
              order_item_id, order_id, product_id, variation_id, customer_id, date_created, product_qty,
              product_net_revenue, product_gross_revenue, coupon_amount, tax_amount, shipping_amount, shipping_tax_amount
-           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           ON CONFLICT (order_item_id) DO UPDATE SET
+             product_id = EXCLUDED.product_id, variation_id = EXCLUDED.variation_id, customer_id = EXCLUDED.customer_id,
+             date_created = EXCLUDED.date_created, product_qty = EXCLUDED.product_qty,
+             product_net_revenue = EXCLUDED.product_net_revenue, product_gross_revenue = EXCLUDED.product_gross_revenue,
+             coupon_amount = EXCLUDED.coupon_amount, tax_amount = EXCLUDED.tax_amount,
+             shipping_amount = EXCLUDED.shipping_amount, shipping_tax_amount = EXCLUDED.shipping_tax_amount`,
           [
-            row.order_item_id, id, row.product_id ?? null, row.variation_id ?? 0, row.customer_id ?? null,
-            row.date_created || null, row.product_qty ?? 0, row.product_net_revenue ?? 0,
+            row.order_item_id, orderId, row.product_id ?? null, row.variation_id ?? 0, row.customer_id ?? customer_id,
+            row.date_created || date_created_gmt, row.product_qty ?? 0, row.product_net_revenue ?? 0,
             row.product_gross_revenue ?? 0, row.coupon_amount ?? 0, row.tax_amount ?? 0,
             row.shipping_amount ?? 0, row.shipping_tax_amount ?? 0,
           ]
         );
       }
-    }
-
-    // gb_wc_order_tax_lookup — full replace for this order_id. Same optional/best-effort rule.
-    if (Array.isArray(tax_lookup)) {
-      await client.query(`DELETE FROM gb_wc_order_tax_lookup WHERE order_id = $1`, [id]);
-      for (const row of tax_lookup) {
-        if (!row.tax_rate_id) continue;
+    } else if (lineItemsForLookup.length > 0) {
+      // Auto-generate product lookup rows from line items if not explicitly provided
+      for (const li of lineItemsForLookup) {
+        if (!li.product_id) continue;
+        const netRev = Number(li.total || li.subtotal || 0);
+        const taxVal = Number(li.tax || 0);
+        const grossRev = netRev + taxVal;
         await client.query(
-          `INSERT INTO gb_wc_order_tax_lookup (order_id, tax_rate_id, date_created, shipping_tax, order_tax, total_tax)
-           VALUES ($1, $2, $3, $4, $5, $6)`,
-          [id, row.tax_rate_id, row.date_created || null, row.shipping_tax ?? 0, row.order_tax ?? 0, row.total_tax ?? 0]
+          `INSERT INTO gb_wc_order_product_lookup (
+             order_item_id, order_id, product_id, variation_id, customer_id, date_created, product_qty,
+             product_net_revenue, product_gross_revenue, coupon_amount, tax_amount, shipping_amount, shipping_tax_amount
+           ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)
+           ON CONFLICT (order_item_id) DO UPDATE SET
+             product_id = EXCLUDED.product_id, variation_id = EXCLUDED.variation_id, customer_id = EXCLUDED.customer_id,
+             date_created = EXCLUDED.date_created, product_qty = EXCLUDED.product_qty,
+             product_net_revenue = EXCLUDED.product_net_revenue, product_gross_revenue = EXCLUDED.product_gross_revenue,
+             coupon_amount = EXCLUDED.coupon_amount, tax_amount = EXCLUDED.tax_amount,
+             shipping_amount = EXCLUDED.shipping_amount, shipping_tax_amount = EXCLUDED.shipping_tax_amount`,
+          [
+            li.order_item_id, orderId, li.product_id, li.variation_id || 0, customer_id,
+            date_created_gmt, Number(li.quantity) || 1, netRev, grossRev, 0, taxVal, 0, 0,
+          ]
         );
       }
     }
 
-    // gb_wc_order_stats — upsert (one row per order_id). Same optional/best-effort rule.
-    if (stats && typeof stats === "object") {
+    // 7. gb_wc_order_tax_lookup — Full replace for this order_id
+    await client.query(`DELETE FROM gb_wc_order_tax_lookup WHERE order_id = $1`, [orderId]);
+    const taxLookupData = Array.isArray(body.tax_lookup)
+      ? body.tax_lookup
+      : (Array.isArray(body.tax_lines)
+          ? body.tax_lines.map((tl) => ({
+              tax_rate_id: tl.rate_id || tl.tax_rate_id || tl.id,
+              date_created: tl.date_created || date_created_gmt,
+              shipping_tax: tl.shipping_tax_total || tl.shipping_tax || 0,
+              order_tax: tl.tax_total || tl.order_tax || 0,
+              total_tax: (Number(tl.tax_total || 0) + Number(tl.shipping_tax_total || 0)) || tl.total_tax || 0,
+            }))
+          : []);
+
+    for (const row of taxLookupData) {
+      if (!row.tax_rate_id) continue;
       await client.query(
-        `INSERT INTO gb_wc_order_stats (
-           order_id, parent_id, date_created, date_created_gmt, date_paid, date_completed,
-           num_items_sold, total_sales, tax_total, shipping_total, net_total, returning_customer,
-           status, customer_id
-         ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
-         ON CONFLICT (order_id) DO UPDATE SET
-           parent_id = EXCLUDED.parent_id,
-           date_created = EXCLUDED.date_created,
-           date_created_gmt = EXCLUDED.date_created_gmt,
-           date_paid = EXCLUDED.date_paid,
-           date_completed = EXCLUDED.date_completed,
-           num_items_sold = EXCLUDED.num_items_sold,
-           total_sales = EXCLUDED.total_sales,
-           tax_total = EXCLUDED.tax_total,
-           shipping_total = EXCLUDED.shipping_total,
-           net_total = EXCLUDED.net_total,
-           returning_customer = EXCLUDED.returning_customer,
-           status = EXCLUDED.status,
-           customer_id = EXCLUDED.customer_id`,
-        [
-          id, stats.parent_id ?? 0, stats.date_created || null, stats.date_created_gmt || null,
-          stats.date_paid || null, stats.date_completed || null, stats.num_items_sold ?? 0,
-          stats.total_sales ?? 0, stats.tax_total ?? 0, stats.shipping_total ?? 0, stats.net_total ?? 0,
-          stats.returning_customer ?? null, status || null, customer_id ?? null,
-        ]
+        `INSERT INTO gb_wc_order_tax_lookup (order_id, tax_rate_id, date_created, shipping_tax, order_tax, total_tax)
+         VALUES ($1, $2, $3, $4, $5, $6)
+         ON CONFLICT (order_id, tax_rate_id) DO UPDATE SET
+           date_created = EXCLUDED.date_created, shipping_tax = EXCLUDED.shipping_tax,
+           order_tax = EXCLUDED.order_tax, total_tax = EXCLUDED.total_tax`,
+        [orderId, row.tax_rate_id, row.date_created || date_created_gmt, row.shipping_tax ?? 0, row.order_tax ?? 0, row.total_tax ?? 0]
       );
     }
 
+    // 8. gb_wc_order_stats — Upsert one row per order_id
+    const statsData = (body.stats && typeof body.stats === "object") ? body.stats : {
+      parent_id: parent_order_id,
+      date_created: date_created_gmt,
+      date_created_gmt: date_created_gmt,
+      date_paid: opData.date_paid_gmt,
+      date_completed: opData.date_completed_gmt,
+      num_items_sold: totalItemsSold > 0 ? totalItemsSold : 1,
+      total_sales: Number(total_amount) || 0,
+      tax_total: Number(tax_amount) || 0,
+      shipping_total: Number(opData.shipping_total_amount) || 0,
+      net_total: Math.max(0, (Number(total_amount) || 0) - (Number(tax_amount) || 0) - (Number(opData.shipping_total_amount) || 0)),
+      returning_customer: false,
+    };
+
+    await client.query(
+      `INSERT INTO gb_wc_order_stats (
+         order_id, parent_id, date_created, date_created_gmt, date_paid, date_completed,
+         num_items_sold, total_sales, tax_total, shipping_total, net_total, returning_customer,
+         status, customer_id
+       ) VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
+       ON CONFLICT (order_id) DO UPDATE SET
+         parent_id = EXCLUDED.parent_id,
+         date_created = EXCLUDED.date_created,
+         date_created_gmt = EXCLUDED.date_created_gmt,
+         date_paid = EXCLUDED.date_paid,
+         date_completed = EXCLUDED.date_completed,
+         num_items_sold = EXCLUDED.num_items_sold,
+         total_sales = EXCLUDED.total_sales,
+         tax_total = EXCLUDED.tax_total,
+         shipping_total = EXCLUDED.shipping_total,
+         net_total = EXCLUDED.net_total,
+         returning_customer = EXCLUDED.returning_customer,
+         status = EXCLUDED.status,
+         customer_id = EXCLUDED.customer_id`,
+      [
+        orderId, statsData.parent_id ?? 0, statsData.date_created || date_created_gmt, statsData.date_created_gmt || date_created_gmt,
+        statsData.date_paid || null, statsData.date_completed || null, statsData.num_items_sold ?? 0,
+        statsData.total_sales ?? 0, statsData.tax_total ?? 0, statsData.shipping_total ?? 0, statsData.net_total ?? 0,
+        statsData.returning_customer ?? false, status, customer_id,
+      ]
+    );
+
+    // 11 & 12. gb_comments & gb_commentmeta (Order notes if sent)
+    if (Array.isArray(body.notes) && body.notes.length > 0) {
+      for (const note of body.notes) {
+        const commentId = note.comment_id || note.id;
+        const noteContent = note.content || note.note || "";
+        if (!commentId || !noteContent) continue;
+
+        await client.query(
+          `INSERT INTO gb_comments
+             (comment_id, comment_post_id, comment_author, comment_author_email, comment_author_url,
+              comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_approved,
+              comment_agent, comment_type, comment_parent, user_id)
+           VALUES ($1, $2, $3, '', '', '', $4, $4, $5, '1', '', 'order_note', 0, $6)
+           ON CONFLICT (comment_id) DO UPDATE SET
+             comment_post_id = EXCLUDED.comment_post_id,
+             comment_author = EXCLUDED.comment_author,
+             comment_date = EXCLUDED.comment_date,
+             comment_date_gmt = EXCLUDED.comment_date_gmt,
+             comment_content = EXCLUDED.comment_content,
+             user_id = EXCLUDED.user_id`,
+          [commentId, orderId, note.author || "WooCommerce", note.date_gmt || date_created_gmt, noteContent, note.user_id ?? 0]
+        );
+
+        await client.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1 AND meta_key = 'is_customer_note'`, [commentId]);
+        if (note.is_customer_note) {
+          await client.query(
+            `INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`,
+            [commentId]
+          );
+        }
+      }
+    }
+
+    // Keep sequences in sync with max IDs in case of any auto-increment inserts
+    await client.query(`
+      SELECT setval('gb_wc_orders_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM gb_wc_orders), 1), true);
+      SELECT setval('gb_wc_orders_meta_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM gb_wc_orders_meta), 1), true);
+      SELECT setval('gb_wc_order_addresses_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM gb_wc_order_addresses), 1), true);
+      SELECT setval('gb_wc_order_operational_data_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM gb_wc_order_operational_data), 1), true);
+      SELECT setval('gb_woocommerce_order_items_order_item_id_seq', GREATEST((SELECT COALESCE(MAX(order_item_id), 1) FROM gb_woocommerce_order_items), 1), true);
+      SELECT setval('gb_woocommerce_order_itemmeta_meta_id_seq', GREATEST((SELECT COALESCE(MAX(meta_id), 1) FROM gb_woocommerce_order_itemmeta), 1), true);
+    `);
+
     await client.query("COMMIT");
 
-    console.log(`[order-webhook] order #${id} synced (order + meta + addresses + operational_data + ${Array.isArray(items) ? items.length : 0} items${Array.isArray(coupon_lookup) ? " + coupon_lookup" : ""}${Array.isArray(product_lookup) ? " + product_lookup" : ""}${Array.isArray(tax_lookup) ? " + tax_lookup" : ""}${stats ? " + stats" : ""})`);
-    res.json({ success: true, order: rows[0] });
+    console.log(`[order-webhook] order #${orderId} synced across all tables (order + meta + addresses + operational_data + ${rawItems.length} items + stats)`);
+    res.json({ success: true, order: orderRows[0] });
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error(`Error saving order ${id} from webhook:`, error);
-    res.status(500).json({ success: false, message: "Failed to save order" });
+    console.error(`Error saving order ${orderId} from webhook:`, error);
+    res.status(500).json({ success: false, message: "Failed to save order", error: error.message });
   } finally {
     client.release();
   }
