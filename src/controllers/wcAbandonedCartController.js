@@ -1,28 +1,76 @@
 const https = require("https");
+const fs = require("fs");
+const path = require("path");
 const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
 
-// Simple in-memory cache to prevent fetching a large dataset on every request
-let cartsCache = {
-  data: null,
-  timestamp: 0
-};
-const CACHE_DURATION = 60 * 1000; // 1 minute cache
+const CACHE_FILE = path.resolve(__dirname, "../../data/wc_abandoned_carts_cache.json");
+const STALE_TTL_MS = 15 * 60 * 1000; // 15 minutes cache before background refresh
 
+// In-memory cache
+let memoryCache = {
+  carts: null,
+  timestamp: 0,
+};
+
+let ongoingFetchPromise = null;
+
+// Helper: load cache from disk on startup or when memory is empty
+const loadDiskCache = () => {
+  try {
+    if (fs.existsSync(CACHE_FILE)) {
+      const raw = fs.readFileSync(CACHE_FILE, "utf8");
+      const parsed = JSON.parse(raw);
+      if (Array.isArray(parsed.carts) && parsed.carts.length > 0) {
+        memoryCache = {
+          carts: parsed.carts,
+          timestamp: parsed.timestamp || fs.statSync(CACHE_FILE).mtimeMs,
+        };
+        console.log(`[wc-carts] Loaded ${memoryCache.carts.length} carts from disk cache.`);
+        return memoryCache.carts;
+      }
+    }
+  } catch (err) {
+    console.warn("[wc-carts] Could not load disk cache:", err.message);
+  }
+  return null;
+};
+
+// Helper: atomically persist cache to disk
+const saveDiskCache = (carts, timestamp) => {
+  try {
+    const dir = path.dirname(CACHE_FILE);
+    if (!fs.existsSync(dir)) fs.mkdirSync(dir, { recursive: true });
+    const payload = JSON.stringify({ timestamp, carts });
+    const tempFile = `${CACHE_FILE}.tmp.${Date.now()}`;
+    fs.writeFileSync(tempFile, payload);
+    fs.renameSync(tempFile, CACHE_FILE);
+  } catch (err) {
+    console.warn("[wc-carts] Failed to save disk cache:", err.message);
+  }
+};
+
+// Immediately load disk cache into memory
+loadDiskCache();
+
+// Fetch all carts from WordPress REST endpoint
 const fetchWcAbandonedCartsFromWordPress = () => {
-  const now = Date.now();
-  if (cartsCache.data && (now - cartsCache.timestamp < CACHE_DURATION)) {
-    return Promise.resolve(cartsCache.data);
+  if (ongoingFetchPromise) {
+    return ongoingFetchPromise;
   }
 
-  return new Promise((resolve, reject) => {
+  ongoingFetchPromise = new Promise((resolve, reject) => {
     const url = getApiUrl("wcAbandonedCarts");
     const authHeader = getBasicAuthHeader();
 
     const options = {
       headers: {
-        "Authorization": authHeader
-      }
+        "Authorization": authHeader,
+        "User-Agent": "Gullybaba-Portal",
+      },
     };
+
+    console.log("[wc-carts] Fetching latest abandoned carts from WordPress...");
+    const startTime = Date.now();
 
     const req = https.get(url, options, (res) => {
       let data = "";
@@ -30,16 +78,20 @@ const fetchWcAbandonedCartsFromWordPress = () => {
         data += chunk;
       });
       res.on("end", () => {
+        ongoingFetchPromise = null;
+        if (res.statusCode !== 200) {
+          return reject(new Error(`WordPress API returned status ${res.statusCode}`));
+        }
         try {
-          if (res.statusCode !== 200) {
-            return reject(new Error(`WordPress API returned status ${res.statusCode}`));
-          }
           const responseBody = JSON.parse(data);
           const carts = responseBody.data || [];
-
-          cartsCache.data = carts;
-          cartsCache.timestamp = Date.now();
-
+          const now = Date.now();
+          memoryCache = {
+            carts,
+            timestamp: now,
+          };
+          saveDiskCache(carts, now);
+          console.log(`[wc-carts] Successfully fetched ${carts.length} carts from WordPress in ${((Date.now() - startTime) / 1000).toFixed(1)}s`);
           resolve(carts);
         } catch (err) {
           reject(err);
@@ -48,11 +100,16 @@ const fetchWcAbandonedCartsFromWordPress = () => {
     });
 
     req.on("error", (err) => {
+      ongoingFetchPromise = null;
+      console.error("[wc-carts] Error fetching from WordPress:", err.message);
       reject(err);
     });
   });
+
+  return ongoingFetchPromise;
 };
 
+// Update abandoned cart note on WordPress
 const updateWcAbandonedCartNoteOnWordPress = (id, notes) => {
   return new Promise((resolve, reject) => {
     const url = new URL(getApiUrl("wcAbandonedCarts", {}, id));
@@ -66,8 +123,9 @@ const updateWcAbandonedCartNoteOnWordPress = (id, notes) => {
       headers: {
         "Authorization": authHeader,
         "Content-Type": "application/json",
-        "Content-Length": Buffer.byteLength(payload)
-      }
+        "Content-Length": Buffer.byteLength(payload),
+        "User-Agent": "Gullybaba-Portal",
+      },
     };
 
     const req = https.request(options, (res) => {
@@ -98,14 +156,39 @@ const updateWcAbandonedCartNoteOnWordPress = (id, notes) => {
 // Get WooCommerce Abandon Cart Lite listing
 exports.getWcAbandonedCarts = async (req, res) => {
   try {
-    const page = parseInt(req.query.page, 10) || 1;
-    const limit = parseInt(req.query.limit, 10) || 20;
-    const search = req.query.search || "";
-    const status = req.query.status || "";
+    const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+    const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+    const search = (req.query.search || "").trim();
+    const status = (req.query.status || "").trim();
+    const forceRefresh = req.query.refresh === "true";
 
-    const carts = await fetchWcAbandonedCartsFromWordPress();
+    // 1. Ensure memory cache is loaded
+    if (!memoryCache.carts) {
+      loadDiskCache();
+    }
 
-    let formattedCarts = carts.map(c => ({
+    const hasData = Array.isArray(memoryCache.carts) && memoryCache.carts.length > 0;
+    const isStale = !hasData || (Date.now() - memoryCache.timestamp > STALE_TTL_MS);
+
+    let carts = null;
+
+    if (forceRefresh || !hasData) {
+      // If we don't have any cached data at all, or user explicitly requested refresh
+      carts = await fetchWcAbandonedCartsFromWordPress();
+    } else {
+      // We have data! Serve it instantly.
+      carts = memoryCache.carts;
+
+      // If data is stale, trigger background refresh so next requests stay fresh without blocking
+      if (isStale && !ongoingFetchPromise) {
+        fetchWcAbandonedCartsFromWordPress().catch((err) => {
+          console.warn("[wc-carts] Background refresh error:", err.message);
+        });
+      }
+    }
+
+    // 2. Format cart items
+    let formattedCarts = carts.map((c) => ({
       id: c.id,
       email: c.email || "—",
       customer: c.customer || "—",
@@ -121,26 +204,31 @@ exports.getWcAbandonedCarts = async (req, res) => {
       order_edit_link: c.order_edit_link || null,
       abandoned_date: c.abandoned_date,
       status: c.status || "Abandoned",
-      notes: c.notes || ""
+      notes: c.notes || "",
     }));
 
+    // 3. In-memory filter: Search
     if (search) {
       const queryLower = search.toLowerCase();
-      formattedCarts = formattedCarts.filter(c =>
-        c.email.toLowerCase().includes(queryLower) ||
-        c.customer.toLowerCase().includes(queryLower)
+      formattedCarts = formattedCarts.filter(
+        (c) =>
+          c.email.toLowerCase().includes(queryLower) ||
+          c.customer.toLowerCase().includes(queryLower) ||
+          (c.phone && c.phone.includes(queryLower)) ||
+          (c.notes && c.notes.toLowerCase().includes(queryLower))
       );
     }
 
+    // 4. In-memory filter: Status
     if (status && status !== "all") {
-      formattedCarts = formattedCarts.filter(c =>
-        c.status.toLowerCase() === status.toLowerCase()
+      formattedCarts = formattedCarts.filter(
+        (c) => c.status.toLowerCase() === status.toLowerCase()
       );
     }
 
+    // 5. Pagination
     const total = formattedCarts.length;
     const totalPages = Math.ceil(total / limit) || 1;
-
     const startIndex = (page - 1) * limit;
     const paginatedCarts = formattedCarts.slice(startIndex, startIndex + limit);
 
@@ -151,18 +239,42 @@ exports.getWcAbandonedCarts = async (req, res) => {
         page,
         limit,
         total,
-        totalPages
-      }
+        totalPages,
+      },
+      cached_at: memoryCache.timestamp,
+      is_refreshing: !!ongoingFetchPromise,
     });
   } catch (error) {
     console.error("Error fetching WooCommerce Abandon Cart Lite data:", error);
+
+    // Fallback: If fetch failed but we have any cached data on disk, return it!
+    if (memoryCache.carts && memoryCache.carts.length > 0) {
+      console.log("[wc-carts] Serving cached data as fallback after error.");
+      const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+      const limit = Math.min(100, Math.max(1, parseInt(req.query.limit, 10) || 20));
+      const startIndex = (page - 1) * limit;
+      return res.json({
+        success: true,
+        carts: memoryCache.carts.slice(startIndex, startIndex + limit),
+        pagination: {
+          page,
+          limit,
+          total: memoryCache.carts.length,
+          totalPages: Math.ceil(memoryCache.carts.length / limit) || 1,
+        },
+        cached_at: memoryCache.timestamp,
+        warning: "Served from offline cache due to upstream error",
+      });
+    }
+
     return res.status(500).json({
       success: false,
-      message: "Failed to fetch WooCommerce abandoned carts"
+      message: "Failed to fetch WooCommerce abandoned carts",
     });
   }
 };
 
+// Update note with optimistic local cache update
 exports.updateWcAbandonedCartNote = async (req, res) => {
   try {
     const { id } = req.params;
@@ -171,24 +283,31 @@ exports.updateWcAbandonedCartNote = async (req, res) => {
     if (typeof notes !== "string") {
       return res.status(400).json({
         success: false,
-        message: "notes field is required"
+        message: "notes field is required",
       });
     }
 
-    await updateWcAbandonedCartNoteOnWordPress(id, notes);
+    // 1. Optimistically update local in-memory & disk cache immediately
+    if (memoryCache.carts) {
+      const cart = memoryCache.carts.find((c) => String(c.id) === String(id));
+      if (cart) {
+        cart.notes = notes;
+      }
+      saveDiskCache(memoryCache.carts, memoryCache.timestamp);
+    }
 
-    cartsCache.data = null;
-    cartsCache.timestamp = 0;
+    // 2. Persist to WordPress in background or await
+    await updateWcAbandonedCartNoteOnWordPress(id, notes);
 
     return res.json({
       success: true,
-      message: "Note updated successfully"
+      message: "Note updated successfully",
     });
   } catch (error) {
     console.error("Error updating WooCommerce abandoned cart note:", error);
     return res.status(500).json({
       success: false,
-      message: "Failed to update abandoned cart note"
+      message: "Failed to update abandoned cart note",
     });
   }
 };
