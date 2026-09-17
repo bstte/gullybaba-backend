@@ -620,30 +620,36 @@ async function buildOrdersPayload(orderRows) {
 
   const buildShippingLine = (item) => {
     const im = itemMetaByItem.get(item.order_item_id) || [];
+    const cost = metaValue(im, "cost")
+      ?? metaValue(im, "total")
+      ?? metaValue(im, "shipping_cost")
+      ?? metaValue(im, "_line_total")
+      ?? metaValue(im, "amount");
     return {
       id: item.order_item_id,
       method_title: item.order_item_name,
       method_id: metaValue(im, "method_id") || "",
       instance_id: metaValue(im, "instance_id") || "",
-      total: num(metaValue(im, "cost")),
+      total: num(cost),
       total_tax: num(metaValue(im, "total_tax")),
       taxes: [],
-      meta_data: [],
+      meta_data: im.map((m) => ({ id: m.meta_id, key: m.meta_key, value: m.meta_value })),
     };
   };
 
   const buildFeeLine = (item) => {
     const im = itemMetaByItem.get(item.order_item_id) || [];
+    const feeTotal = metaValue(im, "_line_total") ?? metaValue(im, "_fee_amount") ?? metaValue(im, "total") ?? metaValue(im, "amount") ?? metaValue(im, "cost");
     return {
       id: item.order_item_id,
       name: item.order_item_name,
       tax_class: metaValue(im, "_tax_class") || "",
       tax_status: metaValue(im, "_tax_status") || "",
-      amount: num(metaValue(im, "_fee_amount")),
-      total: num(metaValue(im, "_line_total")),
+      amount: num(metaValue(im, "_fee_amount") || feeTotal),
+      total: num(feeTotal),
       total_tax: num(metaValue(im, "_line_tax")),
       taxes: [],
-      meta_data: [],
+      meta_data: im.map((m) => ({ id: m.meta_id, key: m.meta_key, value: m.meta_value })),
     };
   };
 
@@ -670,6 +676,32 @@ async function buildOrdersPayload(orderRows) {
     const feeLines = items.filter((i) => i.order_item_type === "fee").map(buildFeeLine);
     const couponLines = items.filter((i) => i.order_item_type === "coupon").map(buildCouponLine);
 
+    // If shipping line total ended up as 0.00, but operational data has shipping_total_amount > 0,
+    // and there is 1 shipping line, assign that shipping_total_amount to it
+    const opShipping = Number(op.shipping_total_amount) || 0;
+    if (shippingLines.length === 1 && parseFloat(shippingLines[0].total) === 0 && opShipping > 0) {
+      shippingLines[0].total = num(opShipping);
+    }
+
+    const calculatedShippingTotal = shippingLines.reduce((sum, s) => sum + parseFloat(s.total || "0"), 0);
+    const finalShippingTotal = opShipping > 0 ? num(opShipping) : num(calculatedShippingTotal);
+
+    // If order has a shipping amount but no items had order_item_type = 'shipping', synthesize one
+    const effectiveShippingLines = shippingLines.length > 0
+      ? shippingLines
+      : (opShipping > 0
+          ? [{
+              id: 0,
+              method_title: "Shipping",
+              method_id: "shipping",
+              instance_id: "",
+              total: num(opShipping),
+              total_tax: num(op.shipping_tax_amount),
+              taxes: [],
+              meta_data: [],
+            }]
+          : []);
+
     const status = stripStatusPrefix(o.status);
 
     return {
@@ -690,7 +722,7 @@ async function buildOrdersPayload(orderRows) {
       date_paid_gmt: op.date_paid_gmt || null,
       discount_total: num(op.discount_total_amount),
       discount_tax: num(op.discount_tax_amount),
-      shipping_total: num(op.shipping_total_amount),
+      shipping_total: finalShippingTotal,
       shipping_tax: num(op.shipping_tax_amount),
       cart_tax: null, // not stored in any imported table
       total: num(o.total_amount),
@@ -714,7 +746,7 @@ async function buildOrdersPayload(orderRows) {
       meta_data: meta.map((m) => ({ id: m.id, key: m.meta_key, value: m.meta_value })),
       line_items: lineItems,
       tax_lines: [], // no order_item_type='tax' rows exist in the imported data
-      shipping_lines: shippingLines,
+      shipping_lines: effectiveShippingLines,
       fee_lines: feeLines,
       coupon_lines: couponLines,
       refunds: refunds.map((r) => ({
@@ -731,7 +763,7 @@ async function buildOrderListPayload(orderRows) {
   if (orderRows.length === 0) return [];
   const orderIds = orderRows.map((o) => o.id);
 
-  const [addressesRes, categoriesRes, attributionRes] = await Promise.all([
+  const [addressesRes, categoriesRes, attributionRes, shippingRes] = await Promise.all([
     pool.query(`SELECT * FROM gb_wc_order_addresses WHERE order_id = ANY($1)`, [orderIds]),
     pool.query(
       `SELECT oi.order_id, im.meta_value AS category
@@ -743,6 +775,11 @@ async function buildOrderListPayload(orderRows) {
     pool.query(
       `SELECT order_id, meta_key, meta_value FROM gb_wc_orders_meta
        WHERE order_id = ANY($1) AND meta_key IN ('_wc_order_attribution_source_type', '_wc_order_attribution_utm_source')`,
+      [orderIds]
+    ),
+    pool.query(
+      `SELECT order_id, order_item_name FROM gb_woocommerce_order_items
+       WHERE order_id = ANY($1) AND order_item_type = 'shipping'`,
       [orderIds]
     ),
   ]);
@@ -763,6 +800,11 @@ async function buildOrderListPayload(orderRows) {
   attributionRes.rows.forEach((r) => {
     if (!attributionByOrder.has(r.order_id)) attributionByOrder.set(r.order_id, {});
     attributionByOrder.get(r.order_id)[r.meta_key] = r.meta_value;
+  });
+
+  const shippingByOrder = new Map();
+  shippingRes.rows.forEach((r) => {
+    if (!shippingByOrder.has(r.order_id)) shippingByOrder.set(r.order_id, r.order_item_name);
   });
 
   const buildAddress = (addrRow, fields) => {
@@ -794,6 +836,7 @@ async function buildOrderListPayload(orderRows) {
       date_created: o.date_created_gmt,
       total: num(o.total_amount),
       customer_id: o.customer_id,
+      shipping_method: shippingByOrder.get(o.id) || "",
       billing: {
         ...buildAddress(addr.billing, ["first_name", "last_name", "phone"]),
         email: (addr.billing && addr.billing.email) || o.billing_email || "",
@@ -1110,6 +1153,18 @@ exports.createOrder = async (req, res) => {
     recorded_sales: op.recorded_sales ?? true,
   };
 
+  // If shipping_total_amount is 0, but shipping items were passed, infer it
+  if (Number(opData.shipping_total_amount) === 0) {
+    if (Array.isArray(body.shipping_lines) && body.shipping_lines.length > 0) {
+      const sSum = body.shipping_lines.reduce((acc, s) => acc + Number(s.cost || s.total || s.amount || s.shipping_amount || 0), 0);
+      if (sSum > 0) opData.shipping_total_amount = sSum;
+    } else if (Array.isArray(body.items)) {
+      const sItems = body.items.filter((i) => i.order_item_type === "shipping" || i.type === "shipping" || i.method_title);
+      const sSum = sItems.reduce((acc, s) => acc + Number(s.cost || s.total || s.amount || s.shipping_amount || 0), 0);
+      if (sSum > 0) opData.shipping_total_amount = sSum;
+    }
+  }
+
   // Addresses normalization (supports body.addresses.billing or root body.billing)
   const billingAddress = body.addresses?.billing || body.billing || null;
   const shippingAddress = body.addresses?.shipping || body.shipping || null;
@@ -1382,9 +1437,14 @@ exports.createOrder = async (req, res) => {
           tax: lineTax,
         });
       } else if (itemType === "shipping") {
-        if (item.method_id && !existingKeys.has("method_id")) itemMetaList.push({ key: "method_id", value: item.method_id });
-        if (item.instance_id && !existingKeys.has("instance_id")) itemMetaList.push({ key: "instance_id", value: item.instance_id });
-        if (item.total !== undefined && !existingKeys.has("cost")) itemMetaList.push({ key: "cost", value: String(item.total) });
+        const costVal = item.cost !== undefined ? item.cost : (item.total !== undefined ? item.total : (item.amount !== undefined ? item.amount : (item.shipping_amount !== undefined ? item.shipping_amount : null)));
+        if (item.method_id && !existingKeys.has("method_id")) itemMetaList.push({ key: "method_id", value: String(item.method_id) });
+        if (item.instance_id && !existingKeys.has("instance_id")) itemMetaList.push({ key: "instance_id", value: String(item.instance_id) });
+        if (costVal !== null && costVal !== undefined && !existingKeys.has("cost")) {
+          itemMetaList.push({ key: "cost", value: String(costVal) });
+        } else if (!existingKeys.has("cost") && (Number(opData.shipping_total_amount) > 0 || Number(body.shipping_total) > 0)) {
+          itemMetaList.push({ key: "cost", value: String(opData.shipping_total_amount || body.shipping_total) });
+        }
         if (item.total_tax !== undefined && !existingKeys.has("total_tax")) itemMetaList.push({ key: "total_tax", value: String(item.total_tax) });
       } else if (itemType === "fee") {
         if (item.amount !== undefined && !existingKeys.has("_fee_amount")) itemMetaList.push({ key: "_fee_amount", value: String(item.amount) });
@@ -1610,6 +1670,8 @@ exports.createOrder = async (req, res) => {
       SELECT setval('gb_wc_order_operational_data_id_seq', GREATEST((SELECT COALESCE(MAX(id), 1) FROM gb_wc_order_operational_data), 1), true);
       SELECT setval('gb_woocommerce_order_items_order_item_id_seq', GREATEST((SELECT COALESCE(MAX(order_item_id), 1) FROM gb_woocommerce_order_items), 1), true);
       SELECT setval('gb_woocommerce_order_itemmeta_meta_id_seq', GREATEST((SELECT COALESCE(MAX(meta_id), 1) FROM gb_woocommerce_order_itemmeta), 1), true);
+      SELECT setval('gb_comments_comment_id_seq', GREATEST((SELECT COALESCE(MAX(comment_id), 1) FROM gb_comments), 1), true);
+      SELECT setval('gb_commentmeta_meta_id_seq', GREATEST((SELECT COALESCE(MAX(meta_id), 1) FROM gb_commentmeta), 1), true);
     `);
 
     await client.query("COMMIT");
@@ -2407,9 +2469,111 @@ exports.getOrderNotes = async (req, res) => {
   }
 };
 
+// Helper to post an order note to WooCommerce REST API (/wc/v2/orders/:id/notes)
+const sendOrderNoteToWooCommerce = (orderId, notePayload) => {
+  return new Promise((resolve) => {
+    const baseUrl = process.env.WOOCOMMERCE_BASE_URL || "https://gullybababooks.in/wp-json";
+    const ck = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const cs = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const postUrl = `${baseUrl}/wc/v2/orders/${orderId}/notes?consumer_key=${ck}&consumer_secret=${cs}`;
+
+    const parsedUrl = new URL(postUrl);
+    const authHeader = getBasicAuthHeader();
+    const bodyData = JSON.stringify(notePayload);
+
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 443,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: "POST",
+      headers: {
+        "Authorization": authHeader,
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(bodyData),
+        "User-Agent": "Gullybaba-Portal",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          if (res.statusCode >= 200 && res.statusCode < 300) {
+            const json = JSON.parse(data);
+            console.log(`[wc-note] Note synced to WooCommerce order #${orderId}, WC note ID #${json.id}`);
+            resolve(json);
+          } else {
+            console.warn(`[wc-note] WooCommerce returned ${res.statusCode}:`, data);
+            resolve(null);
+          }
+        } catch (err) {
+          console.warn("[wc-note] Failed to parse WooCommerce note response:", err.message);
+          resolve(null);
+        }
+      });
+    });
+
+    req.on("error", (err) => {
+      console.error("[wc-note] Error calling WooCommerce note API:", err.message);
+      resolve(null);
+    });
+
+    req.write(bodyData);
+    req.end();
+  });
+};
+
+// Helper to delete an order note from WooCommerce REST API (/wc/v2/orders/:id/notes/:noteId)
+const deleteOrderNoteFromWooCommerce = (orderId, noteId) => {
+  return new Promise((resolve) => {
+    const baseUrl = process.env.WOOCOMMERCE_BASE_URL || "https://gullybababooks.in/wp-json";
+    const ck = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const cs = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const deleteUrl = `${baseUrl}/wc/v2/orders/${orderId}/notes/${noteId}?force=true&consumer_key=${ck}&consumer_secret=${cs}`;
+
+    const parsedUrl = new URL(deleteUrl);
+    const options = {
+      hostname: parsedUrl.hostname,
+      port: parsedUrl.port || 443,
+      path: parsedUrl.pathname + parsedUrl.search,
+      method: "DELETE",
+      headers: {
+        "Authorization": getBasicAuthHeader(),
+        "User-Agent": "Gullybaba-Portal",
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        if (res.statusCode >= 200 && res.statusCode < 300) {
+          console.log(`[wc-note] Note #${noteId} deleted successfully from WooCommerce order #${orderId}`);
+          resolve({ success: true, statusCode: res.statusCode });
+        } else if (res.statusCode === 404) {
+          console.log(`[wc-note] Note #${noteId} already deleted/not found on WooCommerce`);
+          resolve({ success: true, statusCode: 404 });
+        } else {
+          console.warn(`[wc-note] WooCommerce delete note returned ${res.statusCode}:`, data);
+          resolve({ success: false, statusCode: res.statusCode });
+        }
+      });
+    });
+
+    req.on("error", (err) => {
+      console.error(`[wc-note] Error calling WooCommerce delete note API:`, err.message);
+      resolve({ success: false, error: err.message });
+    });
+
+    req.end();
+  });
+};
+
 // POST /api/orders/local/:id/notes — add an order note. body: { content, note_type }
 // note_type is "customer" for "Note to customer", anything else (including "") is a private note.
-// Mirrors WC_Order::add_order_note(), including the is_customer_note commentmeta flag.
+// Mirrors WC_Order::add_order_note(), including the is_customer_note commentmeta flag, and pushes
+// the note live to the WooCommerce WordPress site.
 exports.addOrderNote = async (req, res) => {
   const { content, note_type } = req.body;
 
@@ -2424,20 +2588,68 @@ exports.addOrderNote = async (req, res) => {
     }
 
     const isCustomerNote = note_type === "customer";
-    const author = req.user?.username || "Admin";
-    const userId = req.user?.id || 0;
+    const author = req.user?.username || req.user?.display_name || req.user?.name || "Admin";
+    const authorEmail = req.user?.email || req.user?.user_email || "";
+    const userId = req.user?.id || req.user?.ID || 0;
+    const trimmedContent = content.trim();
 
-    const { rows } = await pool.query(
-      `INSERT INTO gb_comments
-         (comment_post_id, comment_author, comment_author_email, comment_author_url, comment_author_ip,
-          comment_date, comment_date_gmt, comment_content, comment_approved, comment_agent, comment_type,
-          comment_parent, user_id)
-       VALUES ($1, $2, '', '', '', NOW(), NOW(), $3, '1', '', 'order_note', 0, $4)
-       RETURNING comment_id, comment_author, comment_content, comment_date, user_id`,
-      [req.params.id, author, content.trim(), userId]
-    );
-    const note = rows[0];
+    // 1. Forward note to WooCommerce REST API so WordPress site has it live
+    const wcPayload = {
+      comment_post_ID: String(req.params.id),
+      comment_author: author,
+      comment_author_email: authorEmail,
+      note: trimmedContent,
+      customer_note: isCustomerNote,
+      comment_karma: 0,
+      comment_approved: 1,
+      comment_agent: "WooCommerce",
+      comment_type: "order_note",
+      comment_parent: 0,
+      user_id: String(userId),
+    };
 
+    const wcResult = await sendOrderNoteToWooCommerce(req.params.id, wcPayload);
+    const wpCommentId = wcResult?.id ? Number(wcResult.id) : null;
+
+    // 2. Ensure sequence is ahead of max comment_id to prevent any duplicate key errors
+    await pool.query(`SELECT setval('gb_comments_comment_id_seq', GREATEST((SELECT COALESCE(MAX(comment_id), 1) FROM gb_comments), 1), true)`);
+
+    let note;
+    if (wpCommentId) {
+      // Use the exact comment_id assigned by WordPress
+      const { rows } = await pool.query(
+        `INSERT INTO gb_comments
+           (comment_id, comment_post_id, comment_author, comment_author_email, comment_author_url, comment_author_ip,
+            comment_date, comment_date_gmt, comment_content, comment_approved, comment_agent, comment_type,
+            comment_parent, user_id)
+         VALUES ($1, $2, $3, $4, '', '', NOW(), NOW(), $5, '1', 'WooCommerce', 'order_note', 0, $6)
+         ON CONFLICT (comment_id) DO UPDATE SET
+           comment_content = EXCLUDED.comment_content,
+           comment_author = EXCLUDED.comment_author,
+           comment_date = EXCLUDED.comment_date
+         RETURNING comment_id, comment_author, comment_content, comment_date, user_id`,
+        [wpCommentId, req.params.id, author, authorEmail, trimmedContent, userId]
+      );
+      note = rows[0];
+    } else {
+      // Fallback if WooCommerce call did not return an id
+      const { rows } = await pool.query(
+        `INSERT INTO gb_comments
+           (comment_post_id, comment_author, comment_author_email, comment_author_url, comment_author_ip,
+            comment_date, comment_date_gmt, comment_content, comment_approved, comment_agent, comment_type,
+            comment_parent, user_id)
+         VALUES ($1, $2, $3, '', '', NOW(), NOW(), $4, '1', 'WooCommerce', 'order_note', 0, $5)
+         RETURNING comment_id, comment_author, comment_content, comment_date, user_id`,
+        [req.params.id, author, authorEmail, trimmedContent, userId]
+      );
+      note = rows[0];
+    }
+
+    // Keep sequence ahead of max comment_id
+    await pool.query(`SELECT setval('gb_comments_comment_id_seq', GREATEST((SELECT COALESCE(MAX(comment_id), 1) FROM gb_comments), 1), true)`);
+
+    // 3. Save customer note meta flag
+    await pool.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1 AND meta_key = 'is_customer_note'`, [note.comment_id]);
     if (isCustomerNote) {
       await pool.query(
         `INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`,
@@ -2455,29 +2667,43 @@ exports.addOrderNote = async (req, res) => {
         is_customer_note: isCustomerNote,
         is_system_note: false,
       },
+      synced_to_woocommerce: !!wpCommentId,
     });
   } catch (error) {
     console.error(`Error adding order note for order ${req.params.id}:`, error);
-    res.status(500).json({ success: false, message: "Failed to add order note" });
+    res.status(500).json({ success: false, message: error.message || "Failed to add order note" });
   }
 };
 
 // DELETE /api/orders/local/:id/notes/:noteId
 exports.deleteOrderNote = async (req, res) => {
+  const { id: orderId, noteId } = req.params;
+
   try {
+    // 1. Delete from local database
     const { rows } = await pool.query(
-      `DELETE FROM gb_comments WHERE comment_id = $1 AND comment_post_id = $2 AND comment_type = 'order_note' RETURNING comment_id`,
-      [req.params.noteId, req.params.id]
+      `DELETE FROM gb_comments WHERE comment_id = $1 AND comment_post_id = $2 RETURNING comment_id`,
+      [noteId, orderId]
     );
-    if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Note not found" });
+
+    await pool.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1`, [noteId]);
+
+    // 2. Delete from WooCommerce REST API (/wc/v2/orders/:id/notes/:noteId?force=true&consumer_key=...&consumer_secret=...)
+    const wcResult = await deleteOrderNoteFromWooCommerce(orderId, noteId);
+
+    // If not found in local DB and WooCommerce also reported not found / 404
+    if (rows.length === 0 && (!wcResult || !wcResult.success || wcResult.notFound)) {
+      return res.status(404).json({ success: false, message: "Order note not found" });
     }
 
-    await pool.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1`, [req.params.noteId]);
-
-    res.json({ success: true });
+    res.json({
+      success: true,
+      message: "Order note deleted successfully",
+      deleted_locally: rows.length > 0,
+      deleted_from_woocommerce: !!(wcResult?.success && !wcResult?.notFound),
+    });
   } catch (error) {
-    console.error(`Error deleting order note ${req.params.noteId} for order ${req.params.id}:`, error);
+    console.error(`Error deleting order note ${noteId} for order ${orderId}:`, error);
     res.status(500).json({ success: false, message: "Failed to delete order note" });
   }
 };
