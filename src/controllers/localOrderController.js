@@ -574,6 +574,20 @@ async function buildOrdersPayload(orderRows) {
         }
       : {};
 
+  const resolveMedium = (im) => {
+    const raw = metaValue(im, "Medium") || metaValue(im, "medium") || metaValue(im, "Language") || metaValue(im, "pa_languages");
+    if (!raw) return "";
+    let s = String(raw).trim();
+    const lower = s.toLowerCase();
+    if (lower === "hindi-medium" || lower === "hindi medium" || lower === "hindi") return "Hindi";
+    if (lower === "english-medium" || lower === "english medium" || lower === "english") return "English";
+    if (lower === "sanskrit-medium" || lower === "sanskrit medium" || lower === "sanskrit") return "Sanskrit";
+    if (lower === "urdu-medium" || lower === "urdu medium" || lower === "urdu") return "Urdu";
+    if (lower === "bengali-medium" || lower === "bengali medium" || lower === "bengali") return "Bengali";
+    if (lower === "punjabi-medium" || lower === "punjabi medium" || lower === "punjabi") return "Punjabi";
+    return s.replace(/-medium$/i, "").replace(/^./, (c) => c.toUpperCase());
+  };
+
   const buildLineItem = (item) => {
     const im = itemMetaByItem.get(item.order_item_id) || [];
     const extraMeta = im
@@ -582,6 +596,7 @@ async function buildOrdersPayload(orderRows) {
 
     const quantity = int(metaValue(im, "_qty"));
     const subtotal = num(metaValue(im, "_line_subtotal"));
+    const medium = resolveMedium(im);
 
     return {
       id: item.order_item_id,
@@ -599,6 +614,7 @@ async function buildOrdersPayload(orderRows) {
       sku: metaValue(im, "Code") || null,
       price: quantity > 0 ? (Number(subtotal) / quantity).toFixed(2) : subtotal,
       category: metaValue(im, "Category") || "",
+      medium,
     };
   };
 
