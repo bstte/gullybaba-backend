@@ -42,6 +42,16 @@ router.put("/:id/address", authMiddleware, checkOrdersAccess, checkEditUserDetai
 // secret (see middleware/checkWebhookSecret.js) instead of the admin-panel JWT.
 router.post("/create", checkWebhookSecret, localOrderController.createOrder);
 
+// Called FROM WordPress when order status is changed on WooCommerce — server-to-server,
+// gated by shared secret (x-webhook-secret header, ?secret= query param, or secret in body).
+router.post("/status/sync", checkWebhookSecret, localOrderController.syncOrderStatus);
+router.post("/status-sync", checkWebhookSecret, localOrderController.syncOrderStatus);
+router.post("/status", checkWebhookSecret, localOrderController.syncOrderStatus);
+router.post("/:id/status/sync", checkWebhookSecret, localOrderController.syncOrderStatus);
+router.post("/:id/status-sync", checkWebhookSecret, localOrderController.syncOrderStatus);
+router.put("/:id/status-sync", checkWebhookSecret, localOrderController.syncOrderStatus);
+router.post("/webhook/status", checkWebhookSecret, localOrderController.syncOrderStatus);
+
 // Called FROM WordPress when an order note is added on its side (system note or wp-admin note).
 router.post("/notes/sync", checkWebhookSecret, localOrderController.syncOrderNote);
 router.post("/notes", checkWebhookSecret, localOrderController.syncOrderNote);

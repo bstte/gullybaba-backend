@@ -1784,6 +1784,174 @@ exports.syncOrderAnalytics = async (req, res) => {
   }
 };
 
+// POST /api/orders/status/sync or POST /api/orders/:id/status/sync
+// Webhook called FROM WordPress whenever an order status changes on WordPress/WooCommerce.
+// Protected by checkWebhookSecret middleware (server-to-server).
+// Updates gb_wc_orders, gb_wc_order_stats, and gb_wc_order_operational_data in local Postgres.
+// Does NOT call back to WooCommerce, preventing redundant requests or loops.
+exports.syncOrderStatus = async (req, res) => {
+  const body = req.body || {};
+  const orderId = req.params.id || body.order_id || body.orderId || body.id;
+  const rawStatus = body.status || body.new_status || body.order_status;
+
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: "order_id (or order id in url/body) is required" });
+  }
+
+  if (!rawStatus) {
+    return res.status(400).json({ success: false, message: "status (or new_status) is required" });
+  }
+
+  // Normalize order status (WooCommerce DB format uses "wc-" prefix, except core WordPress post statuses)
+  let status = String(rawStatus).trim();
+  if (!status.startsWith("wc-") && !["trash", "auto-draft"].includes(status)) {
+    status = `wc-${status}`;
+  }
+
+  const cleanStatus = stripStatusPrefix(status);
+  let dateModified = body.date_modified_gmt || body.date_updated_gmt || body.date_modified || body.date_updated;
+  if (!dateModified) {
+    dateModified = new Date().toISOString().slice(0, 19).replace("T", " ");
+  } else if (dateModified instanceof Date) {
+    dateModified = dateModified.toISOString().slice(0, 19).replace("T", " ");
+  } else {
+    dateModified = String(dateModified).replace("T", " ").replace(/\..*$/, "").replace(/Z$/, "");
+  }
+
+  const isCompleted = status === "wc-completed";
+  const isPaid = ["wc-processing", "wc-completed"].includes(status);
+  const datePaid = body.date_paid_gmt || body.date_paid || (isPaid ? dateModified : null);
+  const dateCompleted = body.date_completed_gmt || body.date_completed || (isCompleted ? dateModified : null);
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1. Update gb_wc_orders
+    let { rows: orderRows } = await client.query(
+      `UPDATE gb_wc_orders
+       SET status = $1, date_updated_gmt = COALESCE($2::timestamp, NOW())
+       WHERE id = $3 AND type = 'shop_order'
+       RETURNING id, status, total_amount, customer_id, billing_email, date_created_gmt, date_updated_gmt`,
+      [status, dateModified, orderId]
+    );
+
+    if (orderRows.length === 0) {
+      // Check if order exists with different type
+      const { rows: anyOrder } = await client.query(`SELECT id, type, status FROM gb_wc_orders WHERE id = $1`, [orderId]);
+      if (anyOrder.length > 0) {
+        const { rows: updatedAny } = await client.query(
+          `UPDATE gb_wc_orders SET status = $1, date_updated_gmt = COALESCE($2::timestamp, NOW()) WHERE id = $3 RETURNING id, status, total_amount, customer_id, billing_email, date_created_gmt, date_updated_gmt`,
+          [status, dateModified, orderId]
+        );
+        orderRows = updatedAny;
+      } else {
+        await client.query("ROLLBACK");
+        return res.status(404).json({
+          success: false,
+          message: `Order #${orderId} not found in database. Please ensure order is created first via /api/orders/create.`,
+        });
+      }
+    }
+
+    // 2. Update gb_wc_order_stats if row exists
+    await client.query(
+      `UPDATE gb_wc_order_stats
+       SET status = $1,
+           date_completed = CASE
+             WHEN $2::boolean THEN COALESCE($3::timestamp, date_completed, NOW())
+             ELSE date_completed
+           END,
+           date_paid = CASE
+             WHEN $4::boolean THEN COALESCE($5::timestamp, date_paid, NOW())
+             ELSE date_paid
+           END
+       WHERE order_id = $6`,
+      [status, isCompleted, dateCompleted, isPaid, datePaid, orderId]
+    );
+
+    // 3. Update gb_wc_order_operational_data if row exists
+    await client.query(
+      `UPDATE gb_wc_order_operational_data
+       SET date_completed_gmt = CASE
+             WHEN $1::boolean THEN COALESCE($2::timestamp, date_completed_gmt, NOW())
+             ELSE date_completed_gmt
+           END,
+           date_paid_gmt = CASE
+             WHEN $3::boolean THEN COALESCE($4::timestamp, date_paid_gmt, NOW())
+             ELSE date_paid_gmt
+           END
+       WHERE order_id = $5`,
+      [isCompleted, dateCompleted, isPaid, datePaid, orderId]
+    );
+
+    // 4. Optional: If note is provided, insert into gb_comments
+    const noteContent = body.note || body.note_content || body.comment || body.message;
+    if (noteContent && String(noteContent).trim()) {
+      const author = body.author || body.author_name || body.comment_author || "WordPress";
+      const isCustomerNote = Boolean(body.is_customer_note || body.customer_note);
+
+      if (body.comment_id || body.note_id) {
+        const commentId = body.comment_id || body.note_id;
+        await client.query(
+          `INSERT INTO gb_comments
+             (comment_id, comment_post_id, comment_author, comment_author_email, comment_author_url,
+              comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_approved,
+              comment_agent, comment_type, comment_parent, user_id)
+           VALUES ($1, $2, $3, '', '', '', $4::timestamp, $4::timestamp, $5, '1', 'WooCommerce', 'order_note', 0, 0)
+           ON CONFLICT (comment_id) DO UPDATE SET
+             comment_content = EXCLUDED.comment_content,
+             comment_author = EXCLUDED.comment_author,
+             comment_date = EXCLUDED.comment_date,
+             comment_date_gmt = EXCLUDED.comment_date_gmt`,
+          [commentId, orderId, author, dateModified, String(noteContent).trim()]
+        );
+        if (isCustomerNote) {
+          await client.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1 AND meta_key = 'is_customer_note'`, [commentId]);
+          await client.query(`INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`, [commentId]);
+        }
+      } else {
+        const { rows: insertedComment } = await client.query(
+          `INSERT INTO gb_comments
+             (comment_post_id, comment_author, comment_author_email, comment_author_url,
+              comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_approved,
+              comment_agent, comment_type, comment_parent, user_id)
+           VALUES ($1, $2, '', '', '', $3::timestamp, $3::timestamp, $4, '1', 'WooCommerce', 'order_note', 0, 0)
+           RETURNING comment_id`,
+          [orderId, author, dateModified, String(noteContent).trim()]
+        );
+        if (isCustomerNote && insertedComment.length > 0) {
+          await client.query(
+            `INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`,
+            [insertedComment[0].comment_id]
+          );
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+
+    console.log(`[order-status-sync] order #${orderId} status updated to ${status} via WordPress webhook`);
+
+    return res.json({
+      success: true,
+      message: `Order #${orderId} status updated to ${cleanStatus} successfully`,
+      order: {
+        id: Number(orderId),
+        status: cleanStatus,
+        wc_status: status,
+        date_updated_gmt: orderRows[0]?.date_updated_gmt || dateModified,
+      },
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(`Error updating order status for ID ${orderId} via sync:`, error);
+    return res.status(500).json({ success: false, message: "Failed to update order status", error: error.message });
+  } finally {
+    client.release();
+  }
+};
+
 exports.updateStatus = async (req, res) => {
   const { id } = req.params;
   const { status } = req.body;
