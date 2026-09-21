@@ -18,6 +18,8 @@ const {
 
 router.get("/local", authMiddleware, checkOrdersAccess, localOrderController.getLocalOrders);
 router.get("/local/:id", authMiddleware, checkOrdersAccess, checkViewOrder, localOrderController.getLocalOrderById);
+router.get("/local/:id/downloads", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloads);
+router.get("/:id/downloads", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloads);
 router.get("/local/:id/weight", authMiddleware, checkOrdersAccess, checkOrderWeight, localOrderController.getOrderWeight);
 router.post("/local/:id/tekipost-preview", authMiddleware, checkOrdersAccess, checkSendToTekipost, localOrderController.previewTekipost);
 router.post("/local/:id/shiprocket-preview", authMiddleware, checkOrdersAccess, checkSendToShiprocket, localOrderController.previewShiprocket);

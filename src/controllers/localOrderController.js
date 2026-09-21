@@ -2189,6 +2189,30 @@ exports.getLocalOrderById = async (req, res) => {
   }
 };
 
+// GET /api/orders/local/:id/downloads — fetches downloadable product permissions for this order
+exports.getOrderDownloads = async (req, res) => {
+  const { id } = req.params;
+  try {
+    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const url = `https://gullybababooks.in/wp-json/custom/v1/orders/${id}/downloads?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+
+    const data = await wcGetJson(url);
+    if (!data) {
+      return res.json({ success: true, order_id: Number(id), downloads: [] });
+    }
+
+    return res.json({
+      success: true,
+      order_id: data.order_id || Number(id),
+      downloads: Array.isArray(data.downloads) ? data.downloads : [],
+    });
+  } catch (error) {
+    console.error(`Error fetching downloads for order ${id}:`, error);
+    return res.status(500).json({ success: false, message: "Failed to fetch order downloads", downloads: [] });
+  }
+};
+
 // GET /api/orders/local/:id/weight — ported from the WordPress "Weight (kg)" calculation
 exports.getOrderWeight = async (req, res) => {
   try {
