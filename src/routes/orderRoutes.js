@@ -43,6 +43,8 @@ router.put("/:id/address", authMiddleware, checkOrdersAccess, checkEditUserDetai
 router.post("/create", checkWebhookSecret, localOrderController.createOrder);
 
 // Called FROM WordPress when an order note is added on its side (system note or wp-admin note).
+router.post("/notes/sync", checkWebhookSecret, localOrderController.syncOrderNote);
+router.post("/notes", checkWebhookSecret, localOrderController.syncOrderNote);
 router.post("/:id/notes/sync", checkWebhookSecret, localOrderController.syncOrderNote);
 
 // Called FROM WordPress a couple minutes after order creation, once WooCommerce's own analytics

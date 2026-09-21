@@ -2708,62 +2708,130 @@ exports.deleteOrderNote = async (req, res) => {
   }
 };
 
-// POST /api/orders/:id/notes/sync — webhook for WordPress to call when an order note is added on
-// its side (a WooCommerce system note, e.g. a status-change note, or one added directly in wp-admin),
-// so it shows up in this local copy too. comment_id is preserved as-is from WordPress (not
-// auto-generated) and upserted, so a retried webhook call is safe to resend.
-//
-// Expected JSON body:
-// {
-//   "comment_id": 98765,                 // WordPress comment ID — REQUIRED
-//   "content": "Order status changed from Processing to Completed.",
-//   "author": "WooCommerce",
-//   "date_gmt": "2026-08-31 12:05:00",   // GMT, "YYYY-MM-DD HH:mm:ss"
-//   "user_id": 0,
-//   "is_customer_note": false
-// }
+// POST /api/orders/notes/sync or POST /api/orders/:id/notes/sync
+// Webhook for WordPress to call when an order note is added on its side (a WooCommerce system note,
+// e.g. a status-change note, or a note added in wp-admin).
+// Accepts parameters in either WooCommerce comment format, WooCommerce REST API format, or custom format.
+// Preserves WordPress comment_id and keeps local Postgres sequence synced.
 exports.syncOrderNote = async (req, res) => {
-  const { id } = req.params;
-  const { comment_id, content, author, date_gmt, user_id, is_customer_note } = req.body || {};
+  const body = req.body || {};
+  const orderId = req.params.id || body.order_id || body.comment_post_ID || body.comment_post_id || body.orderId || body.id;
+  const content = body.content || body.note || body.comment_content || body.message;
 
-  if (!comment_id || !content) {
-    return res.status(400).json({ success: false, message: "comment_id and content are required" });
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: "order_id (or comment_post_ID) is required" });
   }
+
+  if (!content || !String(content).trim()) {
+    return res.status(400).json({ success: false, message: "note content is required" });
+  }
+
+  const trimmedContent = String(content).trim();
+  const author = body.author || body.comment_author || body.author_name || "WooCommerce";
+  const authorEmail = body.author_email || body.comment_author_email || body.email || "";
+  const userId = body.user_id ?? body.userId ?? 0;
+
+  const isCustomerNote =
+    body.is_customer_note === true ||
+    body.customer_note === true ||
+    body.is_customer_note === 1 ||
+    body.customer_note === 1 ||
+    body.is_customer_note === "1" ||
+    body.customer_note === "1" ||
+    body.is_customer_note === "true" ||
+    body.customer_note === "true";
+
+  let commentDate = body.date_gmt || body.comment_date_gmt || body.date_created_gmt || body.comment_date || body.date_created || body.date;
+  if (!commentDate) {
+    commentDate = new Date().toISOString().slice(0, 19).replace("T", " ");
+  } else if (commentDate instanceof Date) {
+    commentDate = commentDate.toISOString().slice(0, 19).replace("T", " ");
+  } else {
+    commentDate = String(commentDate).replace("T", " ").replace(/\..*$/, "").replace(/Z$/, "");
+  }
+
+  let commentId = body.comment_id || body.comment_ID || body.id || body.note_id;
+
+  const commentKarma = parseInt(body.comment_karma, 10) || 0;
+  const commentApproved = String(body.comment_approved ?? "1");
+  const commentAgent = body.comment_agent || "WooCommerce";
+  const commentType = body.comment_type || "order_note";
+  const commentParent = parseInt(body.comment_parent, 10) || 0;
 
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
+    let finalCommentId;
+
+    if (commentId) {
+      finalCommentId = Number(commentId);
+      await client.query(
+        `INSERT INTO gb_comments
+           (comment_id, comment_post_id, comment_author, comment_author_email, comment_author_url,
+            comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_karma,
+            comment_approved, comment_agent, comment_type, comment_parent, user_id)
+         VALUES ($1, $2, $3, $4, '', '', $5, $5, $6, $7, $8, $9, $10, $11, $12)
+         ON CONFLICT (comment_id) DO UPDATE SET
+           comment_post_id = EXCLUDED.comment_post_id,
+           comment_author = EXCLUDED.comment_author,
+           comment_author_email = EXCLUDED.comment_author_email,
+           comment_date = EXCLUDED.comment_date,
+           comment_date_gmt = EXCLUDED.comment_date_gmt,
+           comment_content = EXCLUDED.comment_content,
+           comment_karma = EXCLUDED.comment_karma,
+           comment_approved = EXCLUDED.comment_approved,
+           comment_agent = EXCLUDED.comment_agent,
+           comment_type = EXCLUDED.comment_type,
+           comment_parent = EXCLUDED.comment_parent,
+           user_id = EXCLUDED.user_id`,
+        [finalCommentId, orderId, author, authorEmail, commentDate, trimmedContent, commentKarma, commentApproved, commentAgent, commentType, commentParent, userId]
+      );
+    } else {
+      const { rows } = await client.query(
+        `INSERT INTO gb_comments
+           (comment_post_id, comment_author, comment_author_email, comment_author_url,
+            comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_karma,
+            comment_approved, comment_agent, comment_type, comment_parent, user_id)
+         VALUES ($1, $2, $3, '', '', $4, $4, $5, $6, $7, $8, $9, $10, $11)
+         RETURNING comment_id`,
+        [orderId, author, authorEmail, commentDate, trimmedContent, commentKarma, commentApproved, commentAgent, commentType, commentParent, userId]
+      );
+      finalCommentId = Number(rows[0].comment_id);
+    }
+
+    // Always keep sequence ahead of MAX(comment_id)
     await client.query(
-      `INSERT INTO gb_comments
-         (comment_id, comment_post_id, comment_author, comment_author_email, comment_author_url,
-          comment_author_ip, comment_date, comment_date_gmt, comment_content, comment_approved,
-          comment_agent, comment_type, comment_parent, user_id)
-       VALUES ($1, $2, $3, '', '', '', $4, $4, $5, '1', '', 'order_note', 0, $6)
-       ON CONFLICT (comment_id) DO UPDATE SET
-         comment_post_id = EXCLUDED.comment_post_id,
-         comment_author = EXCLUDED.comment_author,
-         comment_date = EXCLUDED.comment_date,
-         comment_date_gmt = EXCLUDED.comment_date_gmt,
-         comment_content = EXCLUDED.comment_content,
-         user_id = EXCLUDED.user_id`,
-      [comment_id, id, author || "WooCommerce", date_gmt || null, content, user_id ?? 0]
+      `SELECT setval('gb_comments_comment_id_seq', GREATEST((SELECT COALESCE(MAX(comment_id), 1) FROM gb_comments), 1), true)`
     );
 
-    await client.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1 AND meta_key = 'is_customer_note'`, [comment_id]);
-    if (is_customer_note) {
+    // Save customer note meta flag
+    await client.query(`DELETE FROM gb_commentmeta WHERE comment_id = $1 AND meta_key = 'is_customer_note'`, [finalCommentId]);
+    if (isCustomerNote) {
       await client.query(
         `INSERT INTO gb_commentmeta (comment_id, meta_key, meta_value) VALUES ($1, 'is_customer_note', '1')`,
-        [comment_id]
+        [finalCommentId]
       );
     }
 
     await client.query("COMMIT");
-    res.json({ success: true });
+
+    res.json({
+      success: true,
+      message: "Order note synced successfully",
+      note: {
+        id: finalCommentId,
+        order_id: Number(orderId),
+        content: trimmedContent,
+        author,
+        date: commentDate,
+        is_customer_note: isCustomerNote,
+      },
+    });
   } catch (error) {
     await client.query("ROLLBACK");
-    console.error(`Error syncing order note ${comment_id} for order ${id}:`, error);
-    res.status(500).json({ success: false, message: "Failed to sync order note" });
+    console.error(`Error syncing order note for order ${orderId}:`, error);
+    res.status(500).json({ success: false, message: error.message || "Failed to sync order note" });
   } finally {
     client.release();
   }
