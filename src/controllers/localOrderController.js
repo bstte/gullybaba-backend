@@ -2213,6 +2213,34 @@ exports.getOrderDownloads = async (req, res) => {
   }
 };
 
+// GET /api/orders/downloadable-products?search=... — search downloadable products
+exports.searchDownloadableProducts = async (req, res) => {
+  const search = req.query.search || "";
+  if (!search || search.trim().length < 3) {
+    return res.json({ success: true, count: 0, products: [] });
+  }
+
+  try {
+    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const url = `https://gullybababooks.in/wp-json/custom/v1/downloadable-products?search=${encodeURIComponent(search.trim())}&consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+
+    const data = await wcGetJson(url);
+    if (!data) {
+      return res.json({ success: true, count: 0, products: [] });
+    }
+
+    return res.json({
+      success: true,
+      count: data.count || (data.products ? data.products.length : 0),
+      products: Array.isArray(data.products) ? data.products : [],
+    });
+  } catch (error) {
+    console.error("Error searching downloadable products:", error);
+    return res.status(500).json({ success: false, message: "Failed to search downloadable products", products: [] });
+  }
+};
+
 // GET /api/orders/local/:id/weight — ported from the WordPress "Weight (kg)" calculation
 exports.getOrderWeight = async (req, res) => {
   try {
