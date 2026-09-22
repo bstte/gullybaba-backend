@@ -183,6 +183,12 @@ exports.getOrders = async (req, res) => {
         },
         payment_method: o.payment_method,
         payment_method_title: o.payment_method_title,
+        shipping_method: (o.shipping_lines && o.shipping_lines[0]?.method_title) || "",
+        shipping_lines: o.shipping_lines || [],
+        is_same_day_delivery: Boolean(
+          (o.shipping_lines && o.shipping_lines.some(s => /same\s*day/i.test(s.method_title || s.method_id || ""))) ||
+          /same\s*day/i.test(o.shipping_method || "")
+        ),
         categories: categories.length > 0 ? Array.from(new Set(categories)).join(", ") : "IGNOU Help Books", // Default category label fallback if none specified
         origin: origin.charAt(0).toUpperCase() + origin.slice(1)
       };

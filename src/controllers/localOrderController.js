@@ -738,6 +738,10 @@ async function buildOrdersPayload(orderRows) {
 
     const status = stripStatusPrefix(o.status);
 
+    const hasSameDay = effectiveShippingLines.some(s =>
+      /same\s*day/i.test(s.method_title || "") || /same\s*day/i.test(s.method_id || "")
+    );
+
     return {
       id: o.id,
       parent_id: o.parent_order_id || 0,
@@ -781,6 +785,7 @@ async function buildOrdersPayload(orderRows) {
       line_items: lineItems,
       tax_lines: [], // no order_item_type='tax' rows exist in the imported data
       shipping_lines: effectiveShippingLines,
+      is_same_day_delivery: hasSameDay,
       fee_lines: feeLines,
       coupon_lines: couponLines,
       refunds: refunds.map((r) => ({
@@ -812,8 +817,10 @@ async function buildOrderListPayload(orderRows) {
       [orderIds]
     ),
     pool.query(
-      `SELECT order_id, order_item_name FROM gb_woocommerce_order_items
-       WHERE order_id = ANY($1) AND order_item_type = 'shipping'`,
+      `SELECT oi.order_id, oi.order_item_name, im.meta_value AS method_id
+       FROM gb_woocommerce_order_items oi
+       LEFT JOIN gb_woocommerce_order_itemmeta im ON im.order_item_id = oi.order_item_id AND im.meta_key = 'method_id'
+       WHERE oi.order_id = ANY($1) AND oi.order_item_type = 'shipping'`,
       [orderIds]
     ),
   ]);
@@ -837,8 +844,13 @@ async function buildOrderListPayload(orderRows) {
   });
 
   const shippingByOrder = new Map();
+  const isSameDayByOrder = new Map();
   shippingRes.rows.forEach((r) => {
     if (!shippingByOrder.has(r.order_id)) shippingByOrder.set(r.order_id, r.order_item_name);
+    const combined = `${r.order_item_name || ""} ${r.method_id || ""}`.toLowerCase();
+    if (combined.includes("same day") || combined.includes("sameday")) {
+      isSameDayByOrder.set(r.order_id, true);
+    }
   });
 
   const buildAddress = (addrRow, fields) => {
@@ -862,6 +874,8 @@ async function buildOrderListPayload(orderRows) {
       }
     }
 
+    const isSameDay = !!(isSameDayByOrder.get(o.id) || /same\s*day/i.test(shippingByOrder.get(o.id) || ""));
+
     return {
       id: o.id,
       order_key: null,
@@ -871,6 +885,7 @@ async function buildOrderListPayload(orderRows) {
       total: num(o.total_amount),
       customer_id: o.customer_id,
       shipping_method: shippingByOrder.get(o.id) || "",
+      is_same_day_delivery: isSameDay,
       billing: {
         ...buildAddress(addr.billing, ["first_name", "last_name", "phone"]),
         email: (addr.billing && addr.billing.email) || o.billing_email || "",
