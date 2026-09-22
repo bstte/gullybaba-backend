@@ -50,6 +50,40 @@ const wcGetJson = (url) => {
   });
 };
 
+// POST-JSON helper against the live WooCommerce site (basic-auth bypass + JSON body)
+const wcPostJson = (url, bodyObj) => {
+  return new Promise((resolve) => {
+    const dataStr = JSON.stringify(bodyObj || {});
+    const urlObj = new URL(url);
+    const options = {
+      hostname: urlObj.hostname,
+      port: urlObj.port || 443,
+      path: urlObj.pathname + urlObj.search,
+      method: "POST",
+      headers: {
+        "Authorization": getBasicAuthHeader(),
+        "Content-Type": "application/json",
+        "Content-Length": Buffer.byteLength(dataStr),
+      },
+    };
+    const req = https.request(options, (res) => {
+      let data = "";
+      res.on("data", (chunk) => { data += chunk; });
+      res.on("end", () => {
+        try {
+          const json = JSON.parse(data);
+          resolve({ statusCode: res.statusCode, data: json });
+        } catch {
+          resolve({ statusCode: res.statusCode, raw: data, data: null });
+        }
+      });
+    });
+    req.on("error", (err) => resolve({ statusCode: 500, error: err.message, data: null }));
+    req.write(dataStr);
+    req.end();
+  });
+};
+
 const ALLOWED_WEIGHT_CATEGORIES = ["ignou-help-books", "ignou-cbcs-help-books", "ignou-combos"];
 const ALLOWED_ASSIGNMENT_CATEGORIES = ["ignou-solved-assignments", "ignou-cbcs-solved-assignments"];
 
@@ -2238,6 +2272,146 @@ exports.searchDownloadableProducts = async (req, res) => {
   } catch (error) {
     console.error("Error searching downloadable products:", error);
     return res.status(500).json({ success: false, message: "Failed to search downloadable products", products: [] });
+  }
+};
+
+// POST /api/orders/local/:id/downloads/grant — grant downloadable permission for a product (or array of products)
+exports.grantOrderDownloadAccess = async (req, res) => {
+  const { id } = req.params;
+  const { product_id, product_ids, download_id, quantity } = req.body;
+
+  const targetProductIds = Array.isArray(product_ids)
+    ? product_ids
+    : product_id
+    ? [product_id]
+    : [];
+
+  if (targetProductIds.length === 0) {
+    return res.status(400).json({ success: false, message: "product_id or product_ids is required" });
+  }
+
+  try {
+    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const baseUrl = `https://gullybababooks.in/wp-json/custom/v1/orders/${id}/downloads/grant?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+
+    const grantedResults = [];
+    const errors = [];
+
+    for (const pid of targetProductIds) {
+      const payload = {
+        product_id: Number(pid),
+        quantity: quantity ? Number(quantity) : 1,
+      };
+      if (download_id) {
+        payload.download_id = download_id;
+      }
+
+      const result = await wcPostJson(baseUrl, payload);
+      if (result.statusCode >= 200 && result.statusCode < 300 && result.data && result.data.success) {
+        grantedResults.push(result.data);
+      } else {
+        const errMsg = (result.data && (result.data.message || result.data.code)) || result.error || `HTTP ${result.statusCode}`;
+        errors.push({ product_id: pid, error: errMsg });
+      }
+    }
+
+    if (grantedResults.length === 0 && errors.length > 0) {
+      return res.status(400).json({
+        success: false,
+        message: errors[0].error || "Failed to grant download access",
+        errors,
+      });
+    }
+
+    return res.json({
+      success: true,
+      order_id: Number(id),
+      results: grantedResults,
+      errors: errors.length > 0 ? errors : undefined,
+    });
+  } catch (error) {
+    console.error(`Error granting download access for order ${id}:`, error);
+    return res.status(500).json({ success: false, message: "Internal server error while granting download access" });
+  }
+};
+
+// POST /api/orders/local/:id/downloads/revoke — revokes downloadable permission for this order
+exports.revokeOrderDownloadAccess = async (req, res) => {
+  const { id } = req.params;
+  const { permission_id, product_id, download_id } = req.body;
+
+  if (!permission_id && !product_id) {
+    return res.status(400).json({ success: false, message: "permission_id or product_id is required" });
+  }
+
+  try {
+    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const url = `https://gullybababooks.in/wp-json/custom/v1/orders/${id}/downloads/revoke?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+
+    const payload = {};
+    if (permission_id) payload.permission_id = Number(permission_id);
+    if (product_id) payload.product_id = Number(product_id);
+    if (download_id) payload.download_id = download_id;
+
+    const result = await wcPostJson(url, payload);
+    if (result.statusCode >= 200 && result.statusCode < 300 && result.data && result.data.success) {
+      return res.json({
+        success: true,
+        message: result.data.message || "Download access revoked successfully",
+        order_id: Number(id),
+        permission_id: permission_id ? Number(permission_id) : undefined,
+      });
+    }
+
+    const errMsg = (result.data && (result.data.message || result.data.code)) || result.error || `HTTP ${result.statusCode}`;
+    return res.status(result.statusCode >= 400 && result.statusCode < 500 ? result.statusCode : 400).json({
+      success: false,
+      message: errMsg,
+    });
+  } catch (error) {
+    console.error(`Error revoking download access for order ${id}:`, error);
+    return res.status(500).json({ success: false, message: "Internal server error while revoking download access" });
+  }
+};
+
+// GET /api/orders/local/:id/downloads/logs — fetch customer download logs
+exports.getOrderDownloadLogs = async (req, res) => {
+  const { id } = req.params;
+  const permissionId = req.query.permission_id;
+  const orderId = id || req.query.order_id;
+
+  try {
+    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
+    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+
+    let url = `https://gullybababooks.in/wp-json/custom/v1/orders/${orderId}/downloads/logs?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+    if (permissionId) {
+      url += `&permission_id=${encodeURIComponent(permissionId)}`;
+    }
+
+    const data = await wcGetJson(url);
+    if (!data) {
+      return res.json({
+        success: true,
+        order_id: orderId ? Number(orderId) : null,
+        permission_id: permissionId ? Number(permissionId) : null,
+        count: 0,
+        logs: [],
+      });
+    }
+
+    return res.json({
+      success: true,
+      order_id: data.order_id || (orderId ? Number(orderId) : null),
+      permission_id: data.permission_id || (permissionId ? Number(permissionId) : null),
+      count: data.count || (Array.isArray(data.logs) ? data.logs.length : 0),
+      logs: Array.isArray(data.logs) ? data.logs : [],
+    });
+  } catch (error) {
+    console.error(`Error fetching download logs for order ${id}:`, error);
+    return res.status(500).json({ success: false, message: "Failed to fetch download logs", logs: [] });
   }
 };
 

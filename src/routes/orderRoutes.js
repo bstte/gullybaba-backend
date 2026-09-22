@@ -21,6 +21,12 @@ router.get("/downloadable-products", authMiddleware, checkOrdersAccess, localOrd
 router.get("/local/:id", authMiddleware, checkOrdersAccess, checkViewOrder, localOrderController.getLocalOrderById);
 router.get("/local/:id/downloads", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloads);
 router.get("/:id/downloads", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloads);
+router.post("/local/:id/downloads/grant", authMiddleware, checkOrdersAccess, localOrderController.grantOrderDownloadAccess);
+router.post("/:id/downloads/grant", authMiddleware, checkOrdersAccess, localOrderController.grantOrderDownloadAccess);
+router.post("/local/:id/downloads/revoke", authMiddleware, checkOrdersAccess, localOrderController.revokeOrderDownloadAccess);
+router.post("/:id/downloads/revoke", authMiddleware, checkOrdersAccess, localOrderController.revokeOrderDownloadAccess);
+router.get("/local/:id/downloads/logs", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloadLogs);
+router.get("/:id/downloads/logs", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloadLogs);
 router.get("/local/:id/weight", authMiddleware, checkOrdersAccess, checkOrderWeight, localOrderController.getOrderWeight);
 router.post("/local/:id/tekipost-preview", authMiddleware, checkOrdersAccess, checkSendToTekipost, localOrderController.previewTekipost);
 router.post("/local/:id/shiprocket-preview", authMiddleware, checkOrdersAccess, checkSendToShiprocket, localOrderController.previewShiprocket);
