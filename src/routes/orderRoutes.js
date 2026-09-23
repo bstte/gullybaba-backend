@@ -10,6 +10,7 @@ const {
   checkEditOrderStatus,
   checkSendToShiprocket,
   checkSendToTekipost,
+  checkSendToDtdc,
   checkOrderWeight,
   checkOrderNote,
   checkDeleteNote,
@@ -30,6 +31,8 @@ router.get("/:id/downloads/logs", authMiddleware, checkOrdersAccess, localOrderC
 router.get("/local/:id/weight", authMiddleware, checkOrdersAccess, checkOrderWeight, localOrderController.getOrderWeight);
 router.post("/local/:id/tekipost-preview", authMiddleware, checkOrdersAccess, checkSendToTekipost, localOrderController.previewTekipost);
 router.post("/local/:id/shiprocket-preview", authMiddleware, checkOrdersAccess, checkSendToShiprocket, localOrderController.previewShiprocket);
+router.post("/local/:id/dtdc-send", authMiddleware, checkOrdersAccess, checkSendToDtdc, localOrderController.sendToDtdc);
+router.post("/local/:id/dtdc-preview", authMiddleware, checkOrdersAccess, checkSendToDtdc, localOrderController.sendToDtdc);
 router.get("/local/:id/tekipost-status", authMiddleware, checkOrdersAccess, localOrderController.fetchTekipostStatus);
 router.get("/local/:id/shiprocket-status", authMiddleware, checkOrdersAccess, localOrderController.fetchShiprocketStatus);
 router.get("/local/:id/notes", authMiddleware, checkOrdersAccess, checkOrderNote, localOrderController.getOrderNotes);

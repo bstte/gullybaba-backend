@@ -488,6 +488,235 @@ async function buildShiprocketPreview(order) {
   return { payload, warnings };
 }
 
+// Ports the WordPress order-send-to-dtdc OSDTDC_Api::build_consignment() payload builder.
+const DTDC_LANGUAGE_CODES = {
+  English: "EN",
+  Hindi: "HI",
+  Bengali: "BN",
+  Punjabi: "PA",
+  Sanskrit: "SA",
+  Urdu: "UR",
+  "english-medium": "EN",
+  "hindi-medium": "HI",
+  "bengali-medium": "BN",
+  "punjabi-medium": "PA",
+  "sanskrit-medium": "SA",
+  "urdu-medium": "UR",
+};
+
+async function buildDtdcPayload(order, customWeight = null) {
+  const warnings = [];
+  const productIds = order.line_items.map((li) => li.product_id);
+  const productMap = await fetchProductsBulk(productIds);
+
+  let commodity = "";
+  const pieces_detail = [];
+  let totalWeight = 0;
+  let totalPieces = 0;
+  let excludedOrderValue = 0;
+  const weightAddon = 0.015;
+
+  for (const li of order.line_items) {
+    const product = productMap[li.product_id];
+    if (!product) {
+      warnings.push(`Product #${li.product_id} (${li.name}) could not be fetched from WooCommerce — treated as excluded.`);
+      excludedOrderValue += parseFloat(li.total || 0);
+      continue;
+    }
+
+    const categories = (product.categories || []).map((c) => c.slug);
+    const isAllowed = categories.some((c) => ALLOWED_WEIGHT_CATEGORIES.includes(c));
+    if (!isAllowed) {
+      excludedOrderValue += parseFloat(li.total || 0);
+      continue;
+    }
+
+    const quantity = Math.max(1, parseInt(li.quantity, 10) || 1);
+    const itemTotal = parseFloat(li.total || 0);
+
+    const itemCode = orderItemMetaValue(li, "Code") || orderItemMetaValue(li, "code") || li.sku || "";
+    let itemLang = orderItemMetaValue(li, "Medium") || orderItemMetaValue(li, "Select Medium") || orderItemMetaValue(li, "pa_languages") || li.medium || "";
+    itemLang = DTDC_LANGUAGE_CODES[itemLang] || itemLang;
+
+    if (itemCode) {
+      const itemCommodity = `${itemCode} - ${itemLang} * ${quantity}`;
+      commodity = commodity ? `${commodity}, ${itemCommodity}` : itemCommodity;
+    }
+
+    if (product.type === "woosb") {
+      const bundleIdsRaw = productMetaValue(product, "woosb_ids");
+      if (bundleIdsRaw) {
+        const bundleIds = bundleIdsRaw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+        const bundleMap = await fetchProductsBulk(bundleIds);
+        const childCount = bundleIds.length;
+        const totalLinePcs = quantity * childCount;
+        const perPieceVal = totalLinePcs > 0 ? (itemTotal / totalLinePcs).toFixed(2) : itemTotal.toFixed(2);
+
+        bundleIds.forEach((bid) => {
+          const bp = bundleMap[bid];
+          if (!bp) return;
+          const childWeight = parseFloat(bp.weight || 0) + weightAddon;
+          const childLength = parseFloat(bp.length) || 10;
+          const childWidth = parseFloat(bp.width) || 10;
+          const childHeight = parseFloat(bp.height) || 10;
+
+          for (let i = 0; i < quantity; i++) {
+            pieces_detail.push({
+              description: commodity,
+              declared_value: perPieceVal,
+              weight: childWeight.toFixed(3),
+              height: childHeight.toFixed(2),
+              length: childLength.toFixed(2),
+              width: childWidth.toFixed(2),
+            });
+            totalPieces++;
+          }
+          totalWeight += childWeight * quantity;
+        });
+      } else {
+        warnings.push(`Bundle product #${li.product_id} (${li.name}) has no woosb_ids; using fallback dimensions.`);
+        for (let i = 0; i < quantity; i++) {
+          pieces_detail.push({
+            description: commodity,
+            declared_value: (quantity > 0 ? itemTotal / quantity : itemTotal).toFixed(2),
+            weight: (0.5 + weightAddon).toFixed(3),
+            height: "10.00",
+            length: "10.00",
+            width: "10.00",
+          });
+          totalPieces++;
+        }
+        totalWeight += (0.5 + weightAddon) * quantity;
+      }
+      continue;
+    }
+
+    let variationWeight = null;
+    if (li.variation_id) {
+      const variation = await fetchVariation(li.product_id, li.variation_id);
+      if (variation && variation.weight) variationWeight = variation.weight;
+    }
+
+    const productWeight = parseFloat(variationWeight || product.weight || 0) + weightAddon;
+    const length = parseFloat(product.length) || 10;
+    const width = parseFloat(product.width) || 10;
+    const height = parseFloat(product.height) || 10;
+
+    const perUnitWeight = productWeight.toFixed(3);
+    const perUnitDeclaredVal = (quantity > 0 ? itemTotal / quantity : itemTotal).toFixed(2);
+
+    for (let i = 0; i < quantity; i++) {
+      pieces_detail.push({
+        product_code: commodity,
+        declared_value: perUnitDeclaredVal,
+        weight: perUnitWeight,
+        height: height.toFixed(2),
+        length: length.toFixed(2),
+        width: width.toFixed(2),
+      });
+    }
+
+    totalWeight += productWeight * quantity;
+    totalPieces += quantity;
+  }
+
+  if (totalWeight <= 0) {
+    totalWeight = 0.5;
+  }
+  if (totalPieces <= 0) {
+    totalPieces = 1;
+  }
+
+  const finalWeight = customWeight && Number(customWeight) > 0 ? Number(customWeight) : totalWeight;
+  const declaredValue = Math.max(0, parseFloat(order.total) - excludedOrderValue);
+  const paymentMethod = (order.payment_method || "").toLowerCase();
+  const isCod = paymentMethod === "cod";
+
+  const shippingState = order.shipping?.state || order.billing?.state || "";
+  const shippingCity = order.shipping?.city || order.billing?.city || "";
+  const shippingAddress1 = order.shipping?.address_1 || order.billing?.address_1 || "";
+  const shippingAddress2 = order.shipping?.address_2 || order.billing?.address_2 || "";
+  const shippingPostcode = order.shipping?.postcode || order.billing?.postcode || "";
+  const customerName = `${order.shipping?.first_name || order.billing?.first_name || ""} ${order.shipping?.last_name || order.billing?.last_name || ""}`.trim();
+  const phone = order.billing?.phone || "";
+
+  const dateParts = new Intl.DateTimeFormat("en-GB", {
+    timeZone: "Asia/Kolkata",
+    day: "2-digit",
+    month: "short",
+    year: "numeric",
+  }).format(new Date(order.date_created)); // e.g. "23 Sep 2026"
+
+  const payload = {
+    customer_code: process.env.DTDC_CUSTOMER_CODE || "GL018",
+    service_type_id: process.env.DTDC_SERVICE_TYPE_ID || "GROUND EXPRESS",
+    load_type: process.env.DTDC_LOAD_TYPE || "NON-DOCUMENT",
+    consignment_type: process.env.DTDC_CONSIGNMENT_TYPE || "Forward",
+    description: commodity,
+    dimension_unit: "cm",
+    length: "10",
+    width: "10",
+    height: "10",
+    weight_unit: "kg",
+    weight: Number(finalWeight).toFixed(3),
+    declared_value: Number(declaredValue).toFixed(2),
+    num_pieces: 1,
+    origin_details: {
+      name: process.env.DTDC_ORIGIN_NAME || "TEST ENTERPRISES",
+      phone: process.env.DTDC_ORIGIN_PHONE || "0000000000",
+      alternate_phone: process.env.DTDC_ORIGIN_ALT_PHONE || "0000000000",
+      address_line_1: process.env.DTDC_ORIGIN_ADDRESS_1 || "",
+      address_line_2: process.env.DTDC_ORIGIN_ADDRESS_2 || "",
+      pincode: process.env.DTDC_ORIGIN_PINCODE || "",
+      city: process.env.DTDC_ORIGIN_CITY || "",
+      latitude: "",
+      longitude: "",
+      state: process.env.DTDC_ORIGIN_STATE || "",
+    },
+    destination_details: {
+      name: customerName,
+      phone,
+      alternate_phone: phone,
+      address_line_1: shippingAddress1,
+      address_line_2: shippingAddress2,
+      pincode: shippingPostcode,
+      city: shippingCity,
+      latitude: "",
+      longitude: "",
+      state: shippingState,
+    },
+    return_details: {
+      address_line_1: process.env.DTDC_RETURN_ADDRESS_1 || "",
+      address_line_2: process.env.DTDC_RETURN_ADDRESS_2 || "",
+      city_name: process.env.DTDC_RETURN_CITY || "",
+      name: process.env.DTDC_RETURN_NAME || "",
+      phone: process.env.DTDC_RETURN_PHONE || "0000000000",
+      pincode: process.env.DTDC_RETURN_PINCODE || "",
+      state_name: process.env.DTDC_RETURN_STATE || "",
+      email: process.env.DTDC_RETURN_EMAIL || "",
+      latitude: "",
+      longitude: "",
+      alternate_phone: process.env.DTDC_RETURN_ALT_PHONE || "0000000000",
+    },
+    customer_reference_number: String(order.id),
+    cod_collection_mode: isCod ? "Cash" : "",
+    cod_amount: isCod ? Number(declaredValue).toFixed(2) : "",
+    commodity_id: "72",
+    eway_bill: "",
+    is_risk_surcharge_applicable: "false",
+    invoice_number: String(order.id),
+    invoice_date: dateParts,
+    reference_number: "",
+    pieces_detail,
+  };
+
+  if (pieces_detail.length === 0) {
+    warnings.push("No valid items to send to DTDC (all line items excluded by category).");
+  }
+
+  return { payload, warnings, pieces_detail };
+}
+
 // Meta keys already surfaced as dedicated line_item fields — excluded from the generic meta_data array
 const LINE_ITEM_CORE_KEYS = new Set([
   "_line_subtotal",
@@ -907,12 +1136,15 @@ exports.getStatusCounts = async (req, res) => {
       `SELECT status, COUNT(*)::int AS count FROM gb_wc_orders WHERE type = 'shop_order' GROUP BY status`
     );
 
+    const isRestricted = Array.isArray(req.allowedStatuses);
     const counts = {};
     let total = 0;
     rows.forEach((r) => {
       const value = stripStatusPrefix(r.status) || r.status;
       counts[value] = (counts[value] || 0) + r.count;
-      total += r.count;
+      if (!isRestricted || req.allowedStatuses.includes(value)) {
+        total += r.count;
+      }
     });
 
     const knownValues = new Set(STATUS_LIST.map((s) => s.value));
@@ -920,10 +1152,23 @@ exports.getStatusCounts = async (req, res) => {
       .filter((v) => !knownValues.has(v))
       .map((v) => ({ value: v, label: v.charAt(0).toUpperCase() + v.slice(1).replace(/-/g, " ") }));
 
+    const fullStatusList = [...STATUS_LIST, ...extraStatuses];
+    const statusList = isRestricted
+      ? fullStatusList.filter((s) => req.allowedStatuses.includes(s.value))
+      : fullStatusList;
+
+    if (isRestricted) {
+      Object.keys(counts).forEach((k) => {
+        if (!req.allowedStatuses.includes(k)) {
+          delete counts[k];
+        }
+      });
+    }
+
     res.json({
       success: true,
       total,
-      statusList: [...STATUS_LIST, ...extraStatuses],
+      statusList,
       counts,
     });
   } catch (error) {
@@ -991,11 +1236,26 @@ exports.getOrders = async (req, res) => {
     const conditions = ["o.type = 'shop_order'"];
     const params = [];
 
+    const isRestricted = Array.isArray(req.allowedStatuses);
+
     if (status && status !== "all") {
-      // Most order statuses are stored with a "wc-" prefix, but a few core
-      // WordPress post statuses (auto-draft, trash) are stored without it.
-      params.push(status, `wc-${status}`);
-      conditions.push(`o.status IN ($${params.length - 1}, $${params.length})`);
+      if (isRestricted && !req.allowedStatuses.includes(status)) {
+        conditions.push("1 = 0");
+      } else {
+        params.push(status, `wc-${status}`);
+        conditions.push(`o.status IN ($${params.length - 1}, $${params.length})`);
+      }
+    } else if (isRestricted) {
+      if (req.allowedStatuses.length === 0) {
+        conditions.push("1 = 0");
+      } else {
+        const allowedFull = [];
+        req.allowedStatuses.forEach((s) => {
+          allowedFull.push(s, `wc-${s}`);
+        });
+        params.push(allowedFull);
+        conditions.push(`o.status = ANY($${params.length})`);
+      }
     }
 
     if (payment_method && payment_method !== "all") {
@@ -2146,10 +2406,28 @@ exports.getLocalOrders = async (req, res) => {
     const conditions = ["type = 'shop_order'"];
     const params = [];
 
-    if (status) {
-      params.push(status, `wc-${status}`);
-      conditions.push(`status IN ($${params.length - 1}, $${params.length})`);
+    const isRestricted = Array.isArray(req.allowedStatuses);
+
+    if (status && status !== "all") {
+      if (isRestricted && !req.allowedStatuses.includes(status)) {
+        conditions.push("1 = 0");
+      } else {
+        params.push(status, `wc-${status}`);
+        conditions.push(`status IN ($${params.length - 1}, $${params.length})`);
+      }
+    } else if (isRestricted) {
+      if (req.allowedStatuses.length === 0) {
+        conditions.push("1 = 0");
+      } else {
+        const allowedFull = [];
+        req.allowedStatuses.forEach((s) => {
+          allowedFull.push(s, `wc-${s}`);
+        });
+        params.push(allowedFull);
+        conditions.push(`status = ANY($${params.length})`);
+      }
     }
+
     if (customerId) {
       params.push(customerId);
       conditions.push(`customer_id = $${params.length}`);
@@ -2191,6 +2469,15 @@ exports.getLocalOrderById = async (req, res) => {
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: "Order not found" });
     }
+
+    const isRestricted = Array.isArray(req.allowedStatuses);
+    if (isRestricted) {
+      const orderStatus = stripStatusPrefix(rows[0].status) || rows[0].status;
+      if (!req.allowedStatuses.includes(orderStatus)) {
+        return res.status(403).json({ success: false, message: "You do not have permission to view this order" });
+      }
+    }
+
     const [order] = await buildOrdersPayload(rows);
 
     const productImages = await fetchProductImages(order.line_items.map((li) => li.product_id));
@@ -2693,6 +2980,199 @@ exports.previewShiprocket = async (req, res) => {
     res.status(500).json({ success: false, message: error.message || "Failed to send order to Shiprocket" });
   }
 };
+
+// Saves DTDC reference number and dtdc_status='Sent' in Postgres and syncs to WooCommerce
+async function markOrderSentToDtdc(orderId, referenceNumber) {
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      `UPDATE gb_wc_orders SET status = 'wc-completed', date_updated_gmt = NOW() WHERE id = $1 AND type = 'shop_order'`,
+      [orderId]
+    );
+
+    const statusRes = await client.query(
+      `UPDATE gb_wc_orders_meta SET meta_value = 'Sent' WHERE order_id = $1 AND meta_key = 'dtdc_status'`,
+      [orderId]
+    );
+    if (statusRes.rowCount === 0) {
+      await client.query(
+        `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, 'dtdc_status', 'Sent')`,
+        [orderId]
+      );
+    }
+
+    if (referenceNumber) {
+      const refRes = await client.query(
+        `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_dtdc_reference_number'`,
+        [referenceNumber, orderId]
+      );
+      if (refRes.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_dtdc_reference_number', $2)`,
+          [orderId, referenceNumber]
+        );
+      }
+    }
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  try {
+    const meta_data = [{ key: "dtdc_status", value: "Sent" }];
+    if (referenceNumber) {
+      meta_data.push({ key: "_dtdc_reference_number", value: referenceNumber });
+    }
+    await updateOrderInWooCommerce(orderId, { status: "completed", meta_data });
+  } catch (error) {
+    console.error(`Failed to sync DTDC status to WooCommerce for order ${orderId}:`, error);
+  }
+}
+
+// POST /api/orders/local/:id/dtdc-send — sends order to DTDC via the WordPress order-send-to-dtdc integration,
+// with direct Softdata API fallback. Saves _dtdc_reference_number and dtdc_status upon success.
+exports.sendToDtdc = async (req, res) => {
+  try {
+    const totalWeight = req.body?.total_weight;
+    if (totalWeight === undefined || totalWeight === null || totalWeight === "") {
+      return res.status(400).json({ success: false, message: "Weight not provided." });
+    }
+    if (!Number.isFinite(Number(totalWeight)) || Number(totalWeight) <= 0) {
+      return res.status(400).json({ success: false, message: "Invalid weight provided." });
+    }
+
+    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      return res.status(404).json({ success: false, message: "Order not found" });
+    }
+    const [order] = await buildOrdersPayload(rows);
+
+    if (order.status === "failed") {
+      return res.status(400).json({ success: false, message: "Order status is failed." });
+    }
+    if (order.status === "cancelled") {
+      return res.status(400).json({ success: false, message: "Order status is cancelled." });
+    }
+
+    // Prevent duplicate sending if already sent
+    const existingRef = (order.meta_data || []).find((m) => m.key === "_dtdc_reference_number")?.value;
+    if (existingRef) {
+      return res.status(400).json({
+        success: false,
+        message: `Order #${order.id} has already been sent to DTDC (Reference: ${existingRef}).`,
+        reference_number: existingRef,
+      });
+    }
+
+    const { payload, warnings, pieces_detail } = await buildDtdcPayload(order, totalWeight);
+
+    if (pieces_detail.length === 0) {
+      return res.status(400).json({
+        success: false,
+        message: "This order has no items in DTDC allowed categories (ignou-help-books, ignou-cbcs-help-books, ignou-combos).",
+        warnings,
+      });
+    }
+
+    let referenceNumber = "";
+    let dtdcResponse = null;
+    let sendSuccess = false;
+    let errorMessage = "";
+
+    // 1. Primary path: Dispatch via WordPress order-send-to-dtdc ajax endpoint
+    try {
+      const wpAjaxUrl = "https://gullybababooks.in/wp-admin/admin-ajax.php";
+      const formData = new URLSearchParams({
+        action: "send_to_dtdc",
+        order_id: String(order.id),
+        total_weight: String(totalWeight),
+      });
+
+      const wpRes = await fetch(wpAjaxUrl, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: formData.toString(),
+      });
+
+      const wpText = await wpRes.text();
+      let wpJson = null;
+      try {
+        wpJson = JSON.parse(wpText);
+      } catch {
+        console.error(`[dtdc] non-JSON response from WP admin-ajax for order #${order.id}:`, wpText.slice(0, 300));
+      }
+
+      if (wpJson) {
+        dtdcResponse = wpJson;
+        if (wpJson.success) {
+          sendSuccess = true;
+          referenceNumber = wpJson.data?.data?.[0]?.reference_number || wpJson.data?.[0]?.reference_number || wpJson.data?.reference_number || "";
+        } else {
+          errorMessage = wpJson.data?.message || wpJson.message || "DTDC request failed via WordPress.";
+        }
+      }
+    } catch (wpErr) {
+      console.warn(`[dtdc] WordPress AJAX call failed for order #${order.id}:`, wpErr.message);
+    }
+
+    // 2. Fallback path: If WP didn't succeed and direct DTDC API key is configured in env
+    if (!sendSuccess && process.env.DTDC_API_KEY && process.env.DTDC_X_ACCESS_TOKEN) {
+      try {
+        const directRes = await httpJsonRequest("https://pxapi.dtdc.in/api/customer/integration/consignment/softdata", {
+          headers: {
+            "Content-Type": "application/json",
+            "api-key": process.env.DTDC_API_KEY,
+            "x-access-token": process.env.DTDC_X_ACCESS_TOKEN,
+          },
+          body: JSON.stringify({ consignments: [payload] }),
+        });
+
+        dtdcResponse = directRes.json || directRes.raw;
+        const dtdcSuccess = directRes.json?.data?.[0]?.success;
+        if (directRes.statusCode >= 200 && directRes.statusCode < 300 && dtdcSuccess !== false) {
+          sendSuccess = true;
+          referenceNumber = directRes.json?.data?.[0]?.reference_number || "";
+        } else {
+          errorMessage = directRes.json?.data?.[0]?.message || directRes.json?.error?.message || errorMessage || "DTDC rejected consignment.";
+        }
+      } catch (directErr) {
+        console.error(`[dtdc] direct API call failed for order #${order.id}:`, directErr.message);
+      }
+    }
+
+    if (!sendSuccess) {
+      return res.status(400).json({
+        success: false,
+        message: errorMessage || "Failed to send order to DTDC.",
+        details: dtdcResponse,
+        warnings,
+      });
+    }
+
+    // Mark order sent in Postgres & sync to WooCommerce
+    await markOrderSentToDtdc(order.id, referenceNumber);
+
+    res.json({
+      success: true,
+      message: `Order #${order.id} sent to DTDC successfully.`,
+      reference_number: referenceNumber,
+      payload,
+      warnings,
+      submission: dtdcResponse,
+    });
+  } catch (error) {
+    console.error(`Error sending order ${req.params.id} to DTDC:`, error);
+    res.status(500).json({ success: false, message: error.message || "Failed to send order to DTDC" });
+  }
+};
+exports.previewDtdc = exports.sendToDtdc;
+
 
 // GET /api/orders/local/:id/tekipost-status — "Click to Get Current Status of tekipost Details".
 // Ports get_tekipost_token() + fetch_tekipost_tracking_details() + save_tekipost_tracking_to_order().

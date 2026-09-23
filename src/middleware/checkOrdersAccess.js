@@ -8,9 +8,11 @@ const { fetchCustomerById } = require("../utils/wcCustomer");
 function requireOrderPermission(requiredValue, deniedMessage) {
   return async (req, res, next) => {
     try {
-      const customer = await fetchCustomerById(req.user.id);
+      const customer = req.customer || (await fetchCustomerById(req.user.id));
+      req.customer = customer;
 
       if (customer.role === "administrator") {
+        req.allowedStatuses = null;
         return next();
       }
 
@@ -20,6 +22,11 @@ function requireOrderPermission(requiredValue, deniedMessage) {
       if (!values.includes(requiredValue)) {
         return res.status(403).json({ success: false, message: deniedMessage });
       }
+
+      const allowedStatusValues = values
+        .filter((v) => typeof v === "string" && v.startsWith("wc-"))
+        .map((v) => v.replace(/^wc-/, ""));
+      req.allowedStatuses = allowedStatusValues;
 
       next();
     } catch (error) {
@@ -49,6 +56,10 @@ module.exports.checkSendToShiprocket = requireOrderPermission(
 module.exports.checkSendToTekipost = requireOrderPermission(
   "send_to_tekipost",
   "You do not have permission to send orders to TekiPost"
+);
+module.exports.checkSendToDtdc = requireOrderPermission(
+  "send_to_dtdc",
+  "You do not have permission to send orders to DTDC"
 );
 module.exports.checkOrderWeight = requireOrderPermission(
   "order_weight",
