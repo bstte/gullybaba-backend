@@ -2501,6 +2501,30 @@ exports.getLocalOrderById = async (req, res) => {
       referrer: metaMap["_wc_order_attribution_referrer"] || "",
     };
 
+    // If DTDC reference number is missing locally, check WooCommerce to backfill it
+    if (!metaMap["_dtdc_reference_number"]) {
+      try {
+        const wcOrder = await wcGetJson(getApiUrl("orders", {}, order.id));
+        const ref = wcOrder?.meta_data?.find((m) => m.key === "_dtdc_reference_number")?.value;
+        if (ref) {
+          metaMap["_dtdc_reference_number"] = ref;
+          order.meta_data.push({ key: "_dtdc_reference_number", value: ref });
+          const updateRes = await pool.query(
+            `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_dtdc_reference_number'`,
+            [ref, order.id]
+          );
+          if (updateRes.rowCount === 0) {
+            await pool.query(
+              `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_dtdc_reference_number', $2)`,
+              [order.id, ref]
+            ).catch(() => {});
+          }
+        }
+      } catch (wcErr) {
+        // Non-blocking
+      }
+    }
+
     // Customer order history, computed from the local orders table
     if (order.customer_id) {
       const statsRes = await pool.query(
@@ -3033,6 +3057,31 @@ async function markOrderSentToDtdc(orderId, referenceNumber) {
   }
 }
 
+// Recursively extracts a DTDC reference number from any response structure
+function extractDtdcReference(obj) {
+  if (!obj) return "";
+  if (typeof obj === "string") {
+    if (/^[A-Z0-9]{8,20}$/i.test(obj.trim())) return obj.trim();
+    return "";
+  }
+  if (Array.isArray(obj)) {
+    for (const item of obj) {
+      const found = extractDtdcReference(item);
+      if (found) return found;
+    }
+  } else if (typeof obj === "object") {
+    if (obj.reference_number) return String(obj.reference_number).trim();
+    if (obj.consignment_no) return String(obj.consignment_no).trim();
+    if (obj.awb_no) return String(obj.awb_no).trim();
+    if (obj.awb) return String(obj.awb).trim();
+    for (const key of Object.keys(obj)) {
+      const found = extractDtdcReference(obj[key]);
+      if (found) return found;
+    }
+  }
+  return "";
+}
+
 // POST /api/orders/local/:id/dtdc-send — sends order to DTDC via the WordPress order-send-to-dtdc integration,
 // with direct Softdata API fallback. Saves _dtdc_reference_number and dtdc_status upon success.
 exports.sendToDtdc = async (req, res) => {
@@ -3112,7 +3161,7 @@ exports.sendToDtdc = async (req, res) => {
         dtdcResponse = wpJson;
         if (wpJson.success) {
           sendSuccess = true;
-          referenceNumber = wpJson.data?.data?.[0]?.reference_number || wpJson.data?.[0]?.reference_number || wpJson.data?.reference_number || "";
+          referenceNumber = extractDtdcReference(wpJson);
         } else {
           errorMessage = wpJson.data?.message || wpJson.message || "DTDC request failed via WordPress.";
         }
@@ -3137,7 +3186,7 @@ exports.sendToDtdc = async (req, res) => {
         const dtdcSuccess = directRes.json?.data?.[0]?.success;
         if (directRes.statusCode >= 200 && directRes.statusCode < 300 && dtdcSuccess !== false) {
           sendSuccess = true;
-          referenceNumber = directRes.json?.data?.[0]?.reference_number || "";
+          referenceNumber = extractDtdcReference(directRes.json) || "";
         } else {
           errorMessage = directRes.json?.data?.[0]?.message || directRes.json?.error?.message || errorMessage || "DTDC rejected consignment.";
         }
@@ -3153,6 +3202,16 @@ exports.sendToDtdc = async (req, res) => {
         details: dtdcResponse,
         warnings,
       });
+    }
+
+    // If WordPress reported success but referenceNumber was not extracted, fetch it directly from WooCommerce
+    if (!referenceNumber) {
+      try {
+        const wcOrder = await wcGetJson(getApiUrl("orders", {}, order.id));
+        referenceNumber = wcOrder?.meta_data?.find((m) => m.key === "_dtdc_reference_number")?.value || "";
+      } catch (wcErr) {
+        console.warn(`[dtdc] Failed to fetch WC order meta for order #${order.id}:`, wcErr.message);
+      }
     }
 
     // Mark order sent in Postgres & sync to WooCommerce
