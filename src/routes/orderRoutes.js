@@ -19,7 +19,7 @@ const {
 
 router.get("/local", authMiddleware, checkOrdersAccess, localOrderController.getLocalOrders);
 router.get("/downloadable-products", authMiddleware, checkOrdersAccess, localOrderController.searchDownloadableProducts);
-router.get("/local/:id", authMiddleware, checkOrdersAccess, checkViewOrder, localOrderController.getLocalOrderById);
+router.get("/local/:id", authMiddleware, checkOrdersAccess, /* checkViewOrder, */ localOrderController.getLocalOrderById);
 router.get("/local/:id/downloads", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloads);
 router.get("/:id/downloads", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloads);
 router.post("/local/:id/downloads/grant", authMiddleware, checkOrdersAccess, localOrderController.grantOrderDownloadAccess);
