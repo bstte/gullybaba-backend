@@ -794,7 +794,8 @@ async function resolveUserNames(userIds) {
       missingIds.slice(0, 15).map(async (id) => {
         try {
           const u = await fetchCustomerById(id);
-          const name = u.username || `${u.first_name || ""} ${u.last_name || ""}`.trim() || `#${id}`;
+          const fullName = `${u.first_name || ""} ${u.last_name || ""}`.trim();
+          const name = u.display_name || fullName || u.username || u.name || `#${id}`;
           userNameCache.set(id, name);
           nameMap[id] = name;
         } catch {
@@ -1045,8 +1046,15 @@ async function buildOrdersPayload(orderRows) {
       deliveredBy = "DTDC";
     }
 
-    const updatedById = oMeta["_last_updated_user"] ? parseInt(oMeta["_last_updated_user"], 10) : null;
-    const updatedBy = updatedById ? (userNameMap[updatedById] || `#${updatedById}`) : "";
+    const updatedUserId = oMeta["_last_updated_user"] ? parseInt(oMeta["_last_updated_user"], 10) : null;
+    let updatedBy = "";
+    if (oMeta["_last_updated_user"]) {
+      if (updatedUserId && Number.isFinite(updatedUserId) && updatedUserId > 0) {
+        updatedBy = userNameMap[updatedUserId] || `#${updatedUserId}`;
+      } else {
+        updatedBy = String(oMeta["_last_updated_user"]);
+      }
+    }
     const orderPaymentType = oMeta["_awcdp_deposits_payment_type"] || oMeta["Payment Type"] || oMeta["payment_type"] || lineItems.find(li => li.payment_type)?.payment_type || "";
 
     return {
@@ -1103,7 +1111,8 @@ async function buildOrdersPayload(orderRows) {
       })),
       delivered_by: deliveredBy,
       updated_by: updatedBy,
-      updated_by_id: updatedById,
+      display_name: updatedBy,
+      updated_by_id: updatedUserId,
     };
   });
 }
@@ -1213,7 +1222,14 @@ async function buildOrderListPayload(orderRows) {
 
     // Update By: user who last updated the order
     const updatedUserId = meta["_last_updated_user"] ? parseInt(meta["_last_updated_user"], 10) : null;
-    const updatedBy = updatedUserId ? (userNameMap[updatedUserId] || `#${updatedUserId}`) : "";
+    let updatedBy = "";
+    if (meta["_last_updated_user"]) {
+      if (updatedUserId && Number.isFinite(updatedUserId) && updatedUserId > 0) {
+        updatedBy = userNameMap[updatedUserId] || `#${updatedUserId}`;
+      } else {
+        updatedBy = String(meta["_last_updated_user"]);
+      }
+    }
 
     return {
       id: o.id,
@@ -1227,6 +1243,7 @@ async function buildOrderListPayload(orderRows) {
       is_same_day_delivery: isSameDay,
       delivered_by: deliveredBy,
       updated_by: updatedBy,
+      display_name: updatedBy,
       updated_by_id: updatedUserId,
       billing: {
         ...buildAddress(addr.billing, ["first_name", "last_name", "phone"]),
@@ -2397,6 +2414,10 @@ exports.updateStatus = async (req, res) => {
     }
 
     if (req.user?.id) {
+      const displayName = req.user.display_name || req.user.name || `${req.user.first_name || ""} ${req.user.last_name || ""}`.trim() || req.user.username;
+      if (displayName) {
+        userNameCache.set(parseInt(req.user.id, 10), displayName);
+      }
       const updateMetaRes = await client.query(
         `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_last_updated_user'`,
         [String(req.user.id), id]
