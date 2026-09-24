@@ -2126,6 +2126,266 @@ exports.createOrder = async (req, res) => {
   }
 };
 
+// PUT /api/orders/:id  OR  POST /api/orders/update  OR  POST /api/orders/:id/update
+// Order update endpoint:
+// Only updates the fields that can change during an order update:
+// 1. Status (gb_wc_orders.status & gb_wc_order_stats.status)
+// 2. Billing Address (gb_wc_order_addresses)
+// 3. Shipping Address (gb_wc_order_addresses)
+// 4. Customer Note (gb_wc_orders.customer_note)
+// 5. Metadata (gb_wc_orders_meta: _last_updated_user, shiprocket_status, tekipost_status, dtdc_status, etc.)
+// 6. date_updated_gmt
+exports.updateOrder = async (req, res) => {
+  const body = req.body || {};
+  const orderId = parseInt(req.params.id || body.id || body.order_id || body.ID, 10);
+
+  if (!orderId || isNaN(orderId)) {
+    return res.status(400).json({ success: false, message: "A valid numeric order id is required" });
+  }
+
+  // Detect whether this is a webhook/server-to-server call from WordPress
+  const webhookSecret = process.env.ORDER_WEBHOOK_SECRET || "gullybaba_order_webhook_2026";
+  const providedSecret =
+    req.headers["x-webhook-secret"] ||
+    req.headers["x-wc-webhook-secret"] ||
+    req.query.secret ||
+    req.query.webhook_secret ||
+    body.webhook_secret ||
+    body.secret;
+
+  const isWebhookFromWordPress =
+    (providedSecret && providedSecret === webhookSecret) ||
+    req.isWebhook === true ||
+    req.headers["x-wc-webhook-topic"] ||
+    body.from_wordpress === true;
+
+  const shouldSyncToWordPress = !isWebhookFromWordPress && body.sync_to_wordpress !== false;
+
+  const client = await pool.connect();
+  try {
+    await client.query("BEGIN");
+
+    // 1. Check existing order
+    const { rows: existingRows } = await client.query(
+      `SELECT id, status, billing_email FROM gb_wc_orders WHERE id = $1`,
+      [orderId]
+    );
+    if (existingRows.length === 0) {
+      await client.query("ROLLBACK");
+      return res.status(404).json({ success: false, message: `Order #${orderId} not found` });
+    }
+    const existing = existingRows[0];
+
+    // 2. Status normalization
+    let newStatus = null;
+    if (body.status !== undefined && body.status !== null) {
+      let rawStatus = String(body.status).trim();
+      if (!rawStatus.startsWith("wc-") && !["trash", "auto-draft"].includes(rawStatus)) {
+        newStatus = `wc-${rawStatus}`;
+      } else {
+        newStatus = rawStatus;
+      }
+    }
+
+    // 3. Billing & Shipping Addresses (if provided)
+    const billingAddress = body.billing || body.addresses?.billing || null;
+    const shippingAddress = body.shipping || body.addresses?.shipping || null;
+
+    if (billingAddress && typeof billingAddress === "object") {
+      const vals = ORDER_ADDRESS_FIELDS.map((f) => (billingAddress[f] !== undefined ? billingAddress[f] : null));
+      const upd = await client.query(
+        `UPDATE gb_wc_order_addresses SET
+           first_name = $1, last_name = $2, company = $3, address_1 = $4, address_2 = $5,
+           city = $6, state = $7, postcode = $8, country = $9, email = $10, phone = $11
+         WHERE order_id = $12 AND address_type = 'billing'`,
+        [...vals, orderId]
+      );
+      if (upd.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_order_addresses
+             (order_id, address_type, first_name, last_name, company, address_1, address_2, city, state, postcode, country, email, phone)
+           VALUES ($1, 'billing', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [orderId, ...vals]
+        );
+      }
+    }
+
+    if (shippingAddress && typeof shippingAddress === "object") {
+      const vals = ORDER_ADDRESS_FIELDS.map((f) => (shippingAddress[f] !== undefined ? shippingAddress[f] : null));
+      const upd = await client.query(
+        `UPDATE gb_wc_order_addresses SET
+           first_name = $1, last_name = $2, company = $3, address_1 = $4, address_2 = $5,
+           city = $6, state = $7, postcode = $8, country = $9, email = $10, phone = $11
+         WHERE order_id = $12 AND address_type = 'shipping'`,
+        [...vals, orderId]
+      );
+      if (upd.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_order_addresses
+             (order_id, address_type, first_name, last_name, company, address_1, address_2, city, state, postcode, country, email, phone)
+           VALUES ($1, 'shipping', $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13)`,
+          [orderId, ...vals]
+        );
+      }
+    }
+
+    // 4. Update core order table: gb_wc_orders
+    const updateFields = ["date_updated_gmt = NOW()"];
+    const updateParams = [orderId];
+    let paramIdx = 2;
+
+    if (newStatus) {
+      updateFields.push(`status = $${paramIdx++}`);
+      updateParams.push(newStatus);
+    }
+    const billingEmail = billingAddress?.email || body.billing_email;
+    if (billingEmail) {
+      updateFields.push(`billing_email = $${paramIdx++}`);
+      updateParams.push(billingEmail);
+    }
+    if (body.customer_note !== undefined) {
+      updateFields.push(`customer_note = $${paramIdx++}`);
+      updateParams.push(body.customer_note);
+    }
+
+    const { rows: updatedOrderRows } = await client.query(
+      `UPDATE gb_wc_orders SET ${updateFields.join(", ")} WHERE id = $1 RETURNING *`,
+      updateParams
+    );
+
+    // Also update order status in gb_wc_order_stats if changed
+    if (newStatus) {
+      await client.query(
+        `UPDATE gb_wc_order_stats SET status = $1 WHERE order_id = $2`,
+        [newStatus, orderId]
+      );
+    }
+
+    // 5. Metadata: gb_wc_orders_meta
+    let rawMeta = [];
+    if (Array.isArray(body.meta_data)) rawMeta = [...body.meta_data];
+    else if (Array.isArray(body.meta)) rawMeta = [...body.meta];
+    else if (body.meta_data && typeof body.meta_data === "object") {
+      rawMeta = Object.entries(body.meta_data).map(([key, value]) => ({ key, value }));
+    }
+
+    // Shortcut fields
+    const shortcutMeta = [
+      "_last_updated_user", "shiprocket_status", "tekipost_status", "dtdc_status",
+      "_dtdc_reference_number", "payment_type"
+    ];
+    for (const sk of shortcutMeta) {
+      if (body[sk] !== undefined && body[sk] !== null && !rawMeta.some((m) => (m.key || m.meta_key) === sk)) {
+        rawMeta.push({ key: sk, value: body[sk] });
+      }
+    }
+
+    // If initiated from local CRM by authenticated user
+    const userId = req.user?.id || null;
+    const userName = req.user?.display_name || req.user?.name || `${req.user?.first_name || ""} ${req.user?.last_name || ""}`.trim() || req.user?.username || null;
+    if (userId) {
+      const existingLastUser = rawMeta.find((m) => (m.key || m.meta_key) === "_last_updated_user");
+      if (existingLastUser) {
+        existingLastUser.value = String(userId);
+      } else {
+        rawMeta.push({ key: "_last_updated_user", value: String(userId) });
+      }
+      if (userName) {
+        userNameCache.set(parseInt(userId, 10), userName);
+      }
+    }
+
+    for (const m of rawMeta) {
+      const metaKey = m.key ?? m.meta_key ?? null;
+      if (!metaKey) continue;
+      let metaVal = m.value !== undefined ? m.value : m.meta_value;
+      if (typeof metaVal === "object" && metaVal !== null) {
+        metaVal = JSON.stringify(metaVal);
+      } else if (metaVal !== null && metaVal !== undefined) {
+        metaVal = String(metaVal);
+      } else {
+        metaVal = null;
+      }
+
+      const updateMetaRes = await client.query(
+        `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = $3`,
+        [metaVal, orderId, metaKey]
+      );
+      if (updateMetaRes.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+          [orderId, metaKey, metaVal]
+        );
+      }
+
+      if (metaKey === "_last_updated_user" && metaVal) {
+        const uId = parseInt(metaVal, 10);
+        if (Number.isFinite(uId) && uId > 0 && !userNameCache.has(uId)) {
+          fetchCustomerById(uId).then((cu) => {
+            const name = cu.display_name || `${cu.first_name || ""} ${cu.last_name || ""}`.trim() || cu.username || `#${uId}`;
+            userNameCache.set(uId, name);
+          }).catch(() => {});
+        }
+      }
+    }
+
+    // 6. Push to WooCommerce if initiated by admin / client from CRM
+    if (shouldSyncToWordPress) {
+      const wcPayload = {};
+      if (newStatus) wcPayload.status = stripStatusPrefix(newStatus);
+      if (billingAddress) wcPayload.billing = billingAddress;
+      if (shippingAddress) wcPayload.shipping = shippingAddress;
+      if (body.customer_note !== undefined) wcPayload.customer_note = body.customer_note;
+
+      const metaToSend = [];
+      if (userId) {
+        metaToSend.push({ key: "_last_updated_user", value: String(userId) });
+      }
+      for (const m of rawMeta) {
+        const k = m.key || m.meta_key;
+        const v = m.value !== undefined ? m.value : m.meta_value;
+        if (k && k !== "_last_updated_user") {
+          metaToSend.push({ key: k, value: typeof v === "object" ? JSON.stringify(v) : String(v) });
+        }
+      }
+      if (metaToSend.length > 0) {
+        wcPayload.meta_data = metaToSend;
+      }
+
+      if (Object.keys(wcPayload).length > 0) {
+        try {
+          await updateOrderInWooCommerce(orderId, wcPayload);
+        } catch (wcError) {
+          await client.query("ROLLBACK");
+          console.error(`Failed to push order update to WooCommerce for #${orderId}:`, wcError.message);
+          return res.status(502).json({
+            success: false,
+            message: `Failed to update order #${orderId} on WordPress/WooCommerce: ${wcError.message}. Local changes were rolled back.`,
+          });
+        }
+      }
+    }
+
+    await client.query("COMMIT");
+
+    console.log(`[order-update] order #${orderId} updated successfully (syncedToWP: ${shouldSyncToWordPress})`);
+    return res.json({
+      success: true,
+      message: `Order #${orderId} updated successfully${shouldSyncToWordPress ? " and synced to WordPress" : ""}`,
+      order: updatedOrderRows[0] || existing,
+    });
+  } catch (error) {
+    await client.query("ROLLBACK");
+    console.error(`Error updating order #${orderId}:`, error);
+    return res.status(500).json({ success: false, message: "Failed to update order", error: error.message });
+  } finally {
+    client.release();
+  }
+};
+
+exports.syncOrderUpdate = exports.updateOrder;
+exports.updateFullOrder = exports.updateOrder;
+
 // POST /api/orders/:id/analytics/sync — webhook for WordPress to re-send just the 4 analytics
 // lookup tables (coupon_lookup, product_lookup, tax_lookup, stats) once WooCommerce has finished
 // computing them in the background (it writes these asynchronously via Action Scheduler, so they're
