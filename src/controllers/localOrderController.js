@@ -1176,6 +1176,56 @@ async function buildOrderListPayload(orderRows) {
     }
   });
 
+  // For orders on the current page missing _last_updated_user locally, check WooCommerce directly
+  const ordersMissingUser = orderRows.filter((o) => {
+    const meta = metaByOrder.get(o.id) || {};
+    return !meta["_last_updated_user"];
+  });
+
+  if (ordersMissingUser.length > 0 && ordersMissingUser.length <= 5) {
+    await Promise.all(
+      ordersMissingUser.map(async (o) => {
+        try {
+          const wcOrderUrl = getApiUrl("orders", {}, o.id);
+          const authHeader = getBasicAuthHeader();
+          const wcData = await new Promise((resolve) => {
+            https.get(wcOrderUrl, { headers: { Authorization: authHeader } }, (wcRes) => {
+              let chunkData = "";
+              wcRes.on("data", (c) => (chunkData += c));
+              wcRes.on("end", () => {
+                try { resolve(JSON.parse(chunkData)); } catch { resolve(null); }
+              });
+            }).on("error", () => resolve(null));
+          });
+          if (wcData && Array.isArray(wcData.meta_data)) {
+            const m = wcData.meta_data.find((item) => item.key === "_last_updated_user");
+            if (m && m.value) {
+              const valStr = String(m.value);
+              if (!metaByOrder.has(o.id)) metaByOrder.set(o.id, {});
+              metaByOrder.get(o.id)["_last_updated_user"] = valStr;
+              const p = parseInt(valStr, 10);
+              if (Number.isFinite(p) && p > 0) userIdsToResolve.push(p);
+
+              pool.query(
+                `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_last_updated_user'`,
+                [valStr, o.id]
+              ).then((upd) => {
+                if (upd.rowCount === 0) {
+                  pool.query(
+                    `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_last_updated_user', $2)`,
+                    [o.id, valStr]
+                  ).catch(() => {});
+                }
+              }).catch(() => {});
+            }
+          }
+        } catch {
+          // ignore
+        }
+      })
+    );
+  }
+
   const userNameMap = await resolveUserNames(userIdsToResolve);
 
   const shippingByOrder = new Map();
@@ -2271,8 +2321,8 @@ exports.updateOrder = async (req, res) => {
 
     // Shortcut fields
     const shortcutMeta = [
-      "_last_updated_user", "shiprocket_status", "tekipost_status", "dtdc_status",
-      "_dtdc_reference_number", "payment_type"
+      "_last_updated_user", "last_updated_user", "updated_by", "updated_by_id", "user_id",
+      "shiprocket_status", "tekipost_status", "dtdc_status", "_dtdc_reference_number", "payment_type"
     ];
     for (const sk of shortcutMeta) {
       if (body[sk] !== undefined && body[sk] !== null && !rawMeta.some((m) => (m.key || m.meta_key) === sk)) {
@@ -2280,19 +2330,58 @@ exports.updateOrder = async (req, res) => {
       }
     }
 
-    // If initiated from local CRM by authenticated user
-    const userId = req.user?.id || null;
-    const userName = req.user?.display_name || req.user?.name || `${req.user?.first_name || ""} ${req.user?.last_name || ""}`.trim() || req.user?.username || null;
-    if (userId) {
+    let incomingLastUser =
+      body._last_updated_user ||
+      body.last_updated_user ||
+      body.updated_by ||
+      body.updated_by_id ||
+      body.user_id ||
+      (req.user?.id ? String(req.user.id) : null);
+
+    // If still missing and this is a sync from WordPress, check WooCommerce directly
+    if (!incomingLastUser) {
+      try {
+        const wcOrderUrl = getApiUrl("orders", {}, orderId);
+        const authHeader = getBasicAuthHeader();
+        const wcData = await new Promise((resolve) => {
+          https.get(wcOrderUrl, { headers: { Authorization: authHeader } }, (wcRes) => {
+            let chunkData = "";
+            wcRes.on("data", (c) => (chunkData += c));
+            wcRes.on("end", () => {
+              try { resolve(JSON.parse(chunkData)); } catch { resolve(null); }
+            });
+          }).on("error", () => resolve(null));
+        });
+        if (wcData && Array.isArray(wcData.meta_data)) {
+          const m = wcData.meta_data.find((item) => item.key === "_last_updated_user");
+          if (m && m.value) incomingLastUser = m.value;
+        }
+      } catch (err) {
+        console.warn(`[updateOrder] Could not fetch _last_updated_user for #${orderId}:`, err.message);
+      }
+    }
+
+    if (incomingLastUser) {
       const existingLastUser = rawMeta.find((m) => (m.key || m.meta_key) === "_last_updated_user");
       if (existingLastUser) {
-        existingLastUser.value = String(userId);
+        existingLastUser.value = String(incomingLastUser);
       } else {
-        rawMeta.push({ key: "_last_updated_user", value: String(userId) });
+        rawMeta.push({ key: "_last_updated_user", value: String(incomingLastUser) });
       }
-      if (userName) {
-        userNameCache.set(parseInt(userId, 10), userName);
+    }
+
+    const incomingUserName = body.updated_by_name || body.display_name || null;
+    if (incomingLastUser && incomingUserName) {
+      const pId = parseInt(incomingLastUser, 10);
+      if (Number.isFinite(pId) && pId > 0) {
+        userNameCache.set(pId, incomingUserName);
       }
+    }
+
+    const userId = req.user?.id || null;
+    const userName = req.user?.display_name || req.user?.name || `${req.user?.first_name || ""} ${req.user?.last_name || ""}`.trim() || req.user?.username || null;
+    if (userId && userName) {
+      userNameCache.set(parseInt(userId, 10), userName);
     }
 
     for (const m of rawMeta) {
@@ -2625,6 +2714,63 @@ exports.syncOrderStatus = async (req, res) => {
             [insertedComment[0].comment_id]
           );
         }
+      }
+    }
+
+    // 5. Update _last_updated_user in gb_wc_orders_meta
+    let updatedUserId =
+      body._last_updated_user ||
+      body.last_updated_user ||
+      body.updated_by ||
+      body.updated_by_id ||
+      body.user_id ||
+      (req.user?.id ? String(req.user.id) : null);
+
+    if (!updatedUserId) {
+      // If WordPress webhook didn't send user, fetch _last_updated_user from WooCommerce API
+      try {
+        const wcOrderUrl = getApiUrl("orders", {}, orderId);
+        const authHeader = getBasicAuthHeader();
+        const wcData = await new Promise((resolve) => {
+          https.get(wcOrderUrl, { headers: { Authorization: authHeader } }, (wcRes) => {
+            let chunkData = "";
+            wcRes.on("data", (c) => (chunkData += c));
+            wcRes.on("end", () => {
+              try { resolve(JSON.parse(chunkData)); } catch { resolve(null); }
+            });
+          }).on("error", () => resolve(null));
+        });
+        if (wcData && Array.isArray(wcData.meta_data)) {
+          const m = wcData.meta_data.find((item) => item.key === "_last_updated_user");
+          if (m && m.value) updatedUserId = m.value;
+        }
+      } catch (err) {
+        console.warn(`[syncOrderStatus] Could not fetch _last_updated_user for #${orderId}:`, err.message);
+      }
+    }
+
+    if (updatedUserId) {
+      const uIdStr = String(updatedUserId);
+      const updateMetaRes = await client.query(
+        `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_last_updated_user'`,
+        [uIdStr, orderId]
+      );
+      if (updateMetaRes.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_last_updated_user', $2)`,
+          [orderId, uIdStr]
+        );
+      }
+      const numId = parseInt(uIdStr, 10);
+      const incomingUserName = body.updated_by_name || body.display_name || null;
+      if (incomingUserName && Number.isFinite(numId) && numId > 0) {
+        userNameCache.set(numId, incomingUserName);
+      } else if (Number.isFinite(numId) && numId > 0 && !userNameCache.has(numId)) {
+        fetchCustomerById(numId).then((cu) => {
+          const fullName = `${cu.first_name || ""} ${cu.last_name || ""}`.trim();
+          const name = cu.display_name || fullName || cu.username || cu.name || `#${numId}`;
+          userNameCache.set(numId, name);
+        }).catch(() => {});
       }
     }
 
