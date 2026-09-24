@@ -2,6 +2,7 @@ const https = require("https");
 const pool = require("../config/database");
 const { updateOrderStatusInWooCommerce, updateOrderInWooCommerce } = require("./orderController");
 const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
+const { fetchCustomerById } = require("../utils/wcCustomer");
 
 // Fetch product thumbnail images from the live WooCommerce API, keyed by product id
 const fetchProductImages = (productIds) => {
@@ -771,6 +772,43 @@ async function fetchOrderRows(where, params) {
   return rows;
 }
 
+const userNameCache = new Map();
+
+async function resolveUserNames(userIds) {
+  const cleanIds = [...new Set(userIds.map((id) => parseInt(id, 10)).filter((id) => Number.isFinite(id) && id > 0))];
+  if (cleanIds.length === 0) return {};
+
+  const nameMap = {};
+  const missingIds = [];
+
+  for (const id of cleanIds) {
+    if (userNameCache.has(id)) {
+      nameMap[id] = userNameCache.get(id);
+    } else {
+      missingIds.push(id);
+    }
+  }
+
+  if (missingIds.length > 0) {
+    await Promise.all(
+      missingIds.slice(0, 15).map(async (id) => {
+        try {
+          const u = await fetchCustomerById(id);
+          const name = u.username || `${u.first_name || ""} ${u.last_name || ""}`.trim() || `#${id}`;
+          userNameCache.set(id, name);
+          nameMap[id] = name;
+        } catch {
+          const fallback = `#${id}`;
+          nameMap[id] = fallback;
+          userNameCache.set(id, fallback);
+        }
+      })
+    );
+  }
+
+  return nameMap;
+}
+
 async function buildOrdersPayload(orderRows) {
   if (orderRows.length === 0) return [];
   const orderIds = orderRows.map((o) => o.id);
@@ -795,10 +833,20 @@ async function buildOrdersPayload(orderRows) {
     addressesByOrder.get(r.order_id)[r.address_type] = r;
   });
   const metaByOrder = new Map();
+  const metaLookupByOrder = new Map();
+  const allUpdatedUserIds = [];
   metaRes.rows.forEach((r) => {
     if (!metaByOrder.has(r.order_id)) metaByOrder.set(r.order_id, []);
     metaByOrder.get(r.order_id).push(r);
+
+    if (!metaLookupByOrder.has(r.order_id)) metaLookupByOrder.set(r.order_id, {});
+    metaLookupByOrder.get(r.order_id)[r.meta_key] = r.meta_value;
+    if (r.meta_key === "_last_updated_user" && r.meta_value) {
+      allUpdatedUserIds.push(r.meta_value);
+    }
   });
+
+  const userNameMap = await resolveUserNames(allUpdatedUserIds);
   const itemsByOrder = new Map();
   itemsRes.rows.forEach((r) => {
     if (!itemsByOrder.has(r.order_id)) itemsByOrder.set(r.order_id, []);
@@ -971,6 +1019,19 @@ async function buildOrdersPayload(orderRows) {
       /same\s*day/i.test(s.method_title || "") || /same\s*day/i.test(s.method_id || "")
     );
 
+    const oMeta = metaLookupByOrder.get(o.id) || {};
+    let deliveredBy = "";
+    if (oMeta["shiprocket_status"] === "Sent") {
+      deliveredBy = "Shiprocket";
+    } else if (oMeta["tekipost_status"] === "Sent") {
+      deliveredBy = "TekiPost";
+    } else if (oMeta["dtdc_status"] === "Sent" || oMeta["_dtdc_reference_number"]) {
+      deliveredBy = "DTDC";
+    }
+
+    const updatedById = oMeta["_last_updated_user"] ? parseInt(oMeta["_last_updated_user"], 10) : null;
+    const updatedBy = updatedById ? (userNameMap[updatedById] || `#${updatedById}`) : "";
+
     return {
       id: o.id,
       parent_id: o.parent_order_id || 0,
@@ -1022,6 +1083,9 @@ async function buildOrdersPayload(orderRows) {
         total: num(r.total_amount),
         date_created: r.date_created_gmt,
       })),
+      delivered_by: deliveredBy,
+      updated_by: updatedBy,
+      updated_by_id: updatedById,
     };
   });
 }
@@ -1031,7 +1095,7 @@ async function buildOrderListPayload(orderRows) {
   if (orderRows.length === 0) return [];
   const orderIds = orderRows.map((o) => o.id);
 
-  const [addressesRes, categoriesRes, attributionRes, shippingRes] = await Promise.all([
+  const [addressesRes, categoriesRes, metaRes, shippingRes] = await Promise.all([
     pool.query(`SELECT * FROM gb_wc_order_addresses WHERE order_id = ANY($1)`, [orderIds]),
     pool.query(
       `SELECT oi.order_id, im.meta_value AS category
@@ -1042,7 +1106,15 @@ async function buildOrderListPayload(orderRows) {
     ),
     pool.query(
       `SELECT order_id, meta_key, meta_value FROM gb_wc_orders_meta
-       WHERE order_id = ANY($1) AND meta_key IN ('_wc_order_attribution_source_type', '_wc_order_attribution_utm_source')`,
+       WHERE order_id = ANY($1) AND meta_key IN (
+         '_wc_order_attribution_source_type',
+         '_wc_order_attribution_utm_source',
+         'shiprocket_status',
+         'tekipost_status',
+         'dtdc_status',
+         '_dtdc_reference_number',
+         '_last_updated_user'
+       )`,
       [orderIds]
     ),
     pool.query(
@@ -1066,11 +1138,18 @@ async function buildOrderListPayload(orderRows) {
     if (r.category) categoriesByOrder.get(r.order_id).add(r.category);
   });
 
-  const attributionByOrder = new Map();
-  attributionRes.rows.forEach((r) => {
-    if (!attributionByOrder.has(r.order_id)) attributionByOrder.set(r.order_id, {});
-    attributionByOrder.get(r.order_id)[r.meta_key] = r.meta_value;
+  const metaByOrder = new Map();
+  const userIdsToResolve = [];
+  metaRes.rows.forEach((r) => {
+    if (!metaByOrder.has(r.order_id)) metaByOrder.set(r.order_id, {});
+    metaByOrder.get(r.order_id)[r.meta_key] = r.meta_value;
+    if (r.meta_key === "_last_updated_user" && r.meta_value) {
+      const parsed = parseInt(r.meta_value, 10);
+      if (Number.isFinite(parsed) && parsed > 0) userIdsToResolve.push(parsed);
+    }
   });
+
+  const userNameMap = await resolveUserNames(userIdsToResolve);
 
   const shippingByOrder = new Map();
   const isSameDayByOrder = new Map();
@@ -1091,11 +1170,11 @@ async function buildOrderListPayload(orderRows) {
   return orderRows.map((o) => {
     const addr = addressesByOrder.get(o.id) || {};
     const categories = categoriesByOrder.get(o.id);
-    const attribution = attributionByOrder.get(o.id) || {};
+    const meta = metaByOrder.get(o.id) || {};
 
     let origin = "Direct";
-    const sourceType = attribution["_wc_order_attribution_source_type"];
-    const utmSource = attribution["_wc_order_attribution_utm_source"];
+    const sourceType = meta["_wc_order_attribution_source_type"];
+    const utmSource = meta["_wc_order_attribution_utm_source"];
     if (sourceType) {
       origin = sourceType;
       if (utmSource && utmSource !== "(direct)") {
@@ -1104,6 +1183,20 @@ async function buildOrderListPayload(orderRows) {
     }
 
     const isSameDay = !!(isSameDayByOrder.get(o.id) || /same\s*day/i.test(shippingByOrder.get(o.id) || ""));
+
+    // Delivered By: Shiprocket, TekiPost, DTDC
+    let deliveredBy = "";
+    if (meta["shiprocket_status"] === "Sent") {
+      deliveredBy = "Shiprocket";
+    } else if (meta["tekipost_status"] === "Sent") {
+      deliveredBy = "TekiPost";
+    } else if (meta["dtdc_status"] === "Sent" || meta["_dtdc_reference_number"]) {
+      deliveredBy = "DTDC";
+    }
+
+    // Update By: user who last updated the order
+    const updatedUserId = meta["_last_updated_user"] ? parseInt(meta["_last_updated_user"], 10) : null;
+    const updatedBy = updatedUserId ? (userNameMap[updatedUserId] || `#${updatedUserId}`) : "";
 
     return {
       id: o.id,
@@ -1115,6 +1208,9 @@ async function buildOrderListPayload(orderRows) {
       customer_id: o.customer_id,
       shipping_method: shippingByOrder.get(o.id) || "",
       is_same_day_delivery: isSameDay,
+      delivered_by: deliveredBy,
+      updated_by: updatedBy,
+      updated_by_id: updatedUserId,
       billing: {
         ...buildAddress(addr.billing, ["first_name", "last_name", "phone"]),
         email: (addr.billing && addr.billing.email) || o.billing_email || "",
@@ -2281,6 +2377,19 @@ exports.updateStatus = async (req, res) => {
     if (rows.length === 0) {
       await client.query("ROLLBACK");
       return res.status(404).json({ success: false, message: "Order not found" });
+    }
+
+    if (req.user?.id) {
+      const updateMetaRes = await client.query(
+        `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_last_updated_user'`,
+        [String(req.user.id), id]
+      );
+      if (updateMetaRes.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_last_updated_user', $2)`,
+          [id, String(req.user.id)]
+        );
+      }
     }
 
     try {
