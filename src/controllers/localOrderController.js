@@ -2431,7 +2431,8 @@ exports.updateStatus = async (req, res) => {
     }
 
     try {
-      await updateOrderStatusInWooCommerce(id, status);
+      const metaData = req.user?.id ? [{ key: "_last_updated_user", value: String(req.user.id) }] : [];
+      await updateOrderStatusInWooCommerce(id, status, metaData);
     } catch (wcError) {
       await client.query("ROLLBACK");
       console.error(`Failed to update WooCommerce status for order ${id}:`, wcError);
@@ -2515,9 +2516,36 @@ exports.updateAddress = async (req, res) => {
       await upsertAddress("shipping", shipping);
     }
 
+    // Update order date_updated_gmt
+    await client.query(
+      `UPDATE gb_wc_orders SET date_updated_gmt = NOW() WHERE id = $1 AND type = 'shop_order'`,
+      [id]
+    );
+
+    // Record the user who updated the order in _last_updated_user
+    if (req.user?.id) {
+      const displayName = req.user.display_name || req.user.name || `${req.user.first_name || ""} ${req.user.last_name || ""}`.trim() || req.user.username;
+      if (displayName) {
+        userNameCache.set(parseInt(req.user.id, 10), displayName);
+      }
+      const updateMetaRes = await client.query(
+        `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_last_updated_user'`,
+        [String(req.user.id), id]
+      );
+      if (updateMetaRes.rowCount === 0) {
+        await client.query(
+          `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_last_updated_user', $2)`,
+          [id, String(req.user.id)]
+        );
+      }
+    }
+
     const wcPayload = {};
     if (billing) wcPayload.billing = billing;
     if (shipping) wcPayload.shipping = shipping;
+    if (req.user?.id) {
+      wcPayload.meta_data = [{ key: "_last_updated_user", value: String(req.user.id) }];
+    }
 
     try {
       await updateOrderInWooCommerce(id, wcPayload);

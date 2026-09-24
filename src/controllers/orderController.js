@@ -93,8 +93,14 @@ const updateOrderInWooCommerce = (id, payload) => {
   });
 };
 
-// Kept for backwards compatibility with existing callers
-const updateOrderStatusInWooCommerce = (id, status) => updateOrderInWooCommerce(id, { status });
+// Kept for backwards compatibility with existing callers, now supporting optional meta_data
+const updateOrderStatusInWooCommerce = (id, status, metaData = []) => {
+  const payload = { status };
+  if (metaData && metaData.length > 0) {
+    payload.meta_data = metaData;
+  }
+  return updateOrderInWooCommerce(id, payload);
+};
 
 exports.updateOrderInWooCommerce = updateOrderInWooCommerce;
 exports.updateOrderStatusInWooCommerce = updateOrderStatusInWooCommerce;
