@@ -871,18 +871,18 @@ async function buildOrdersPayload(orderRows) {
   const buildAddress = (addrRow) =>
     addrRow
       ? {
-          first_name: addrRow.first_name || "",
-          last_name: addrRow.last_name || "",
-          company: addrRow.company || "",
-          address_1: addrRow.address_1 || "",
-          address_2: addrRow.address_2 || "",
-          city: addrRow.city || "",
-          state: addrRow.state || "",
-          postcode: addrRow.postcode || "",
-          country: addrRow.country || "",
-          email: addrRow.email || "",
-          phone: addrRow.phone || "",
-        }
+        first_name: addrRow.first_name || "",
+        last_name: addrRow.last_name || "",
+        company: addrRow.company || "",
+        address_1: addrRow.address_1 || "",
+        address_2: addrRow.address_2 || "",
+        city: addrRow.city || "",
+        state: addrRow.state || "",
+        postcode: addrRow.postcode || "",
+        country: addrRow.country || "",
+        email: addrRow.email || "",
+        phone: addrRow.phone || "",
+      }
       : {};
 
   const resolveMedium = (im) => {
@@ -908,12 +908,21 @@ async function buildOrdersPayload(orderRows) {
     const quantity = int(metaValue(im, "_qty"));
     const subtotal = num(metaValue(im, "_line_subtotal"));
     const medium = resolveMedium(im);
+    const category = metaValue(im, "Category") || metaValue(im, "category") || "";
+    const code = metaValue(im, "Code") || metaValue(im, "code") || metaValue(im, "_sku") || metaValue(im, "sku") || "";
+    const variationId = int(metaValue(im, "_variation_id")) || int(metaValue(im, "variation_id")) || 0;
+    const session = metaValue(im, "Session") || metaValue(im, "session") || metaValue(im, "pa_assignment-session") || metaValue(im, "assignment-session") || "";
+    const type = metaValue(im, "Type") || metaValue(im, "type") || metaValue(im, "pa_assignment-type") || metaValue(im, "assignment-type") || "";
+    const demand = metaValue(im, "Demand") || metaValue(im, "demand") || "";
+    const language = metaValue(im, "Language") || metaValue(im, "language") || medium || metaValue(im, "pa_languages") || "";
+    const enrollmentNo = metaValue(im, "Enrollment No.") || metaValue(im, "Enrollment No") || metaValue(im, "enrolment no") || metaValue(im, "enrollment no") || metaValue(im, "Enrollment") || metaValue(im, "enrollment_no") || "";
+    const paymentType = metaValue(im, "Payment Type") || metaValue(im, "payment type") || metaValue(im, "payment_type") || metaValue(im, "Payment_Type") || "";
 
     return {
       id: item.order_item_id,
       name: item.order_item_name,
       product_id: int(metaValue(im, "_product_id")),
-      variation_id: int(metaValue(im, "_variation_id")),
+      variation_id: variationId,
       quantity,
       tax_class: metaValue(im, "_tax_class") || "",
       subtotal,
@@ -922,10 +931,17 @@ async function buildOrdersPayload(orderRows) {
       total_tax: num(metaValue(im, "_line_tax")),
       taxes: [], // _line_tax_data is PHP-serialized; not decoded here
       meta_data: extraMeta,
-      sku: metaValue(im, "Code") || null,
+      sku: code || metaValue(im, "Code") || null,
+      code,
       price: quantity > 0 ? (Number(subtotal) / quantity).toFixed(2) : subtotal,
-      category: metaValue(im, "Category") || "",
+      category,
       medium,
+      language: language || medium,
+      session,
+      type,
+      demand,
+      enrollment_no: enrollmentNo,
+      payment_type: paymentType,
     };
   };
 
@@ -1001,17 +1017,17 @@ async function buildOrdersPayload(orderRows) {
     const effectiveShippingLines = shippingLines.length > 0
       ? shippingLines
       : (opShipping > 0
-          ? [{
-              id: 0,
-              method_title: "Shipping",
-              method_id: "shipping",
-              instance_id: "",
-              total: num(opShipping),
-              total_tax: num(op.shipping_tax_amount),
-              taxes: [],
-              meta_data: [],
-            }]
-          : []);
+        ? [{
+          id: 0,
+          method_title: "Shipping",
+          method_id: "shipping",
+          instance_id: "",
+          total: num(opShipping),
+          total_tax: num(op.shipping_tax_amount),
+          taxes: [],
+          meta_data: [],
+        }]
+        : []);
 
     const status = stripStatusPrefix(o.status);
 
@@ -1031,11 +1047,13 @@ async function buildOrdersPayload(orderRows) {
 
     const updatedById = oMeta["_last_updated_user"] ? parseInt(oMeta["_last_updated_user"], 10) : null;
     const updatedBy = updatedById ? (userNameMap[updatedById] || `#${updatedById}`) : "";
+    const orderPaymentType = oMeta["_awcdp_deposits_payment_type"] || oMeta["Payment Type"] || oMeta["payment_type"] || lineItems.find(li => li.payment_type)?.payment_type || "";
 
     return {
       id: o.id,
       parent_id: o.parent_order_id || 0,
       status,
+      payment_type: orderPaymentType,
       currency: o.currency,
       currency_symbol: CURRENCY_SYMBOLS[o.currency] || o.currency,
       version: op.woocommerce_version || null,
@@ -1175,13 +1193,12 @@ async function buildOrderListPayload(orderRows) {
     let origin = "Direct";
     const sourceType = meta["_wc_order_attribution_source_type"];
     const utmSource = meta["_wc_order_attribution_utm_source"];
-    if (sourceType) {
+    if (sourceType && sourceType !== "typein") {
       origin = sourceType;
       if (utmSource && utmSource !== "(direct)") {
         origin = `${sourceType}: ${utmSource}`;
       }
     }
-
     const isSameDay = !!(isSameDayByOrder.get(o.id) || /same\s*day/i.test(shippingByOrder.get(o.id) || ""));
 
     // Delivered By: Shiprocket, TekiPost, DTDC
@@ -1896,12 +1913,12 @@ exports.createOrder = async (req, res) => {
     const couponLookupData = Array.isArray(body.coupon_lookup)
       ? body.coupon_lookup
       : (Array.isArray(body.coupon_lines)
-          ? body.coupon_lines.map((cl) => ({
-              coupon_id: cl.coupon_id || cl.id,
-              date_created: cl.date_created || date_created_gmt,
-              discount_amount: cl.discount || cl.discount_amount || 0,
-            }))
-          : []);
+        ? body.coupon_lines.map((cl) => ({
+          coupon_id: cl.coupon_id || cl.id,
+          date_created: cl.date_created || date_created_gmt,
+          discount_amount: cl.discount || cl.discount_amount || 0,
+        }))
+        : []);
 
     for (const row of couponLookupData) {
       if (!row.coupon_id) continue;
@@ -1970,14 +1987,14 @@ exports.createOrder = async (req, res) => {
     const taxLookupData = Array.isArray(body.tax_lookup)
       ? body.tax_lookup
       : (Array.isArray(body.tax_lines)
-          ? body.tax_lines.map((tl) => ({
-              tax_rate_id: tl.rate_id || tl.tax_rate_id || tl.id,
-              date_created: tl.date_created || date_created_gmt,
-              shipping_tax: tl.shipping_tax_total || tl.shipping_tax || 0,
-              order_tax: tl.tax_total || tl.order_tax || 0,
-              total_tax: (Number(tl.tax_total || 0) + Number(tl.shipping_tax_total || 0)) || tl.total_tax || 0,
-            }))
-          : []);
+        ? body.tax_lines.map((tl) => ({
+          tax_rate_id: tl.rate_id || tl.tax_rate_id || tl.id,
+          date_created: tl.date_created || date_created_gmt,
+          shipping_tax: tl.shipping_tax_total || tl.shipping_tax || 0,
+          order_tax: tl.tax_total || tl.order_tax || 0,
+          total_tax: (Number(tl.tax_total || 0) + Number(tl.shipping_tax_total || 0)) || tl.total_tax || 0,
+        }))
+        : []);
 
     for (const row of taxLookupData) {
       if (!row.tax_rate_id) continue;
@@ -2598,10 +2615,15 @@ exports.getLocalOrderById = async (req, res) => {
     // Order attribution, derived from the generic meta_data the order already carries
     const metaMap = {};
     order.meta_data.forEach((m) => { metaMap[m.key] = m.value; });
-    let origin = metaMap["_wc_order_attribution_source_type"] || "Direct";
+
+    let origin = "Direct";
+    const sourceType = metaMap["_wc_order_attribution_source_type"];
     const utmSource = metaMap["_wc_order_attribution_utm_source"];
-    if (utmSource && utmSource !== "(direct)") {
-      origin = `${origin}: ${utmSource}`;
+    if (sourceType && sourceType !== "typein") {
+      origin = sourceType;
+      if (utmSource && utmSource !== "(direct)") {
+        origin = `${sourceType}: ${utmSource}`;
+      }
     }
     order.attribution = {
       origin: origin.charAt(0).toUpperCase() + origin.slice(1),
@@ -2626,7 +2648,7 @@ exports.getLocalOrderById = async (req, res) => {
             await pool.query(
               `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_dtdc_reference_number', $2)`,
               [order.id, ref]
-            ).catch(() => {});
+            ).catch(() => { });
           }
         }
       } catch (wcErr) {
@@ -2718,8 +2740,8 @@ exports.grantOrderDownloadAccess = async (req, res) => {
   const targetProductIds = Array.isArray(product_ids)
     ? product_ids
     : product_id
-    ? [product_id]
-    : [];
+      ? [product_id]
+      : [];
 
   if (targetProductIds.length === 0) {
     return res.status(400).json({ success: false, message: "product_id or product_ids is required" });
@@ -3396,11 +3418,13 @@ exports.fetchTekipostStatus = async (req, res) => {
         let data = ""; r.on("data", (c) => (data += c)); r.on("end", () => resolve(data));
       });
       putReq.on("error", reject);
-      putReq.write(JSON.stringify({ meta_data: [
-        { key: "_tekipost_awb", value: trackingDetails.tracking_number },
-        { key: "_tekipost_courier_name", value: trackingDetails.courier_name },
-        { key: "_tekipost_c_status", value: trackingDetails.tracking_statuses },
-      ] }));
+      putReq.write(JSON.stringify({
+        meta_data: [
+          { key: "_tekipost_awb", value: trackingDetails.tracking_number },
+          { key: "_tekipost_courier_name", value: trackingDetails.courier_name },
+          { key: "_tekipost_c_status", value: trackingDetails.tracking_statuses },
+        ]
+      }));
       putReq.end();
     });
 
@@ -3469,13 +3493,15 @@ exports.fetchShiprocketStatus = async (req, res) => {
         let data = ""; r.on("data", (c) => (data += c)); r.on("end", () => resolve(data));
       });
       putReq.on("error", reject);
-      putReq.write(JSON.stringify({ meta_data: [
-        { key: "_shiprocket_awb", value: trackingDetails.awb_code },
-        { key: "_shiprocket_pickup_date", value: trackingDetails.pickup_date },
-        { key: "_shiprocket_current_status", value: trackingDetails.current_status },
-        { key: "_shiprocket_courier_name", value: trackingDetails.courier_name },
-        { key: "_shiprocket_edd", value: trackingDetails.edd },
-      ] }));
+      putReq.write(JSON.stringify({
+        meta_data: [
+          { key: "_shiprocket_awb", value: trackingDetails.awb_code },
+          { key: "_shiprocket_pickup_date", value: trackingDetails.pickup_date },
+          { key: "_shiprocket_current_status", value: trackingDetails.current_status },
+          { key: "_shiprocket_courier_name", value: trackingDetails.courier_name },
+          { key: "_shiprocket_edd", value: trackingDetails.edd },
+        ]
+      }));
       putReq.end();
     });
 
