@@ -3991,14 +3991,46 @@ exports.getOrderNotes = async (req, res) => {
       [req.params.id]
     );
 
-    const notes = rows.map((r) => ({
-      id: Number(r.comment_id),
-      content: r.comment_content,
-      date: r.comment_date,
-      author: r.comment_author,
-      is_customer_note: r.is_customer_note,
-      is_system_note: Number(r.user_id) === 0 && r.comment_author === "WooCommerce",
-    }));
+    // Resolve user display names
+    const userIds = rows
+      .map((r) => parseInt(r.user_id, 10))
+      .filter((id) => Number.isFinite(id) && id > 0);
+
+    const { rows: lastUserMeta } = await pool.query(
+      `SELECT meta_value FROM gb_wc_orders_meta WHERE order_id = $1 AND meta_key = '_last_updated_user' LIMIT 1`,
+      [req.params.id]
+    );
+    const lastUpdatedUserId = lastUserMeta.length > 0 ? parseInt(lastUserMeta[0].meta_value, 10) : null;
+    if (lastUpdatedUserId && Number.isFinite(lastUpdatedUserId) && lastUpdatedUserId > 0) {
+      userIds.push(lastUpdatedUserId);
+    }
+
+    const userNameMap = await resolveUserNames(userIds);
+
+    const notes = rows.map((r) => {
+      const uId = parseInt(r.user_id, 10);
+      let author = (r.comment_author || "").trim();
+
+      if ((!author || author.toLowerCase() === "woocommerce" || author.toLowerCase() === "wordpress") && uId > 0 && userNameMap[uId]) {
+        author = userNameMap[uId];
+      } else if ((!author || author.toLowerCase() === "woocommerce" || author.toLowerCase() === "wordpress") && /order status changed/i.test(r.comment_content || "") && lastUpdatedUserId && userNameMap[lastUpdatedUserId]) {
+        author = userNameMap[lastUpdatedUserId];
+      }
+
+      const isSystemNote =
+        (!author || author.toLowerCase() === "woocommerce" || author.toLowerCase() === "system") &&
+        (!uId || uId === 0);
+
+      return {
+        id: Number(r.comment_id),
+        content: r.comment_content,
+        date: r.comment_date,
+        author: author,
+        user_id: uId,
+        is_customer_note: r.is_customer_note,
+        is_system_note: isSystemNote,
+      };
+    });
 
     res.json({ success: true, notes });
   } catch (error) {
@@ -4126,7 +4158,7 @@ exports.addOrderNote = async (req, res) => {
     }
 
     const isCustomerNote = note_type === "customer";
-    const author = req.user?.username || req.user?.display_name || req.user?.name || "Admin";
+    const author = req.user?.display_name || req.user?.name || req.user?.username || "Admin";
     const authorEmail = req.user?.email || req.user?.user_email || "";
     const userId = req.user?.id || req.user?.ID || 0;
     const trimmedContent = content.trim();
@@ -4265,7 +4297,7 @@ exports.syncOrderNote = async (req, res) => {
   }
 
   const trimmedContent = String(content).trim();
-  const author = body.author || body.comment_author || body.author_name || "WooCommerce";
+  const author = body.author || body.comment_author || body.author_name || body.added_by || body.updated_by_name || body.display_name || "WooCommerce";
   const authorEmail = body.author_email || body.comment_author_email || body.email || "";
   const userId = body.user_id ?? body.userId ?? 0;
 
