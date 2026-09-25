@@ -4,13 +4,13 @@ const { updateOrderStatusInWooCommerce, updateOrderInWooCommerce } = require("./
 const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
 const { fetchCustomerById } = require("../utils/wcCustomer");
 
-// Fetch product thumbnail images from the live WooCommerce API, keyed by product id
-const fetchProductImages = (productIds) => {
+// Fetch product thumbnail images and details from the live WooCommerce API, keyed by product id
+const fetchProductDetails = (productIds) => {
   return new Promise((resolve) => {
     const ids = [...new Set(productIds.filter(Boolean))];
     if (ids.length === 0) return resolve({});
 
-    const url = getApiUrl("products", { include: ids.join(","), per_page: ids.length });
+    const url = getApiUrl("products", { include: ids.join(","), per_page: Math.min(ids.length, 100) });
     const options = { headers: { "Authorization": getBasicAuthHeader() } };
 
     https.get(url, options, (res) => {
@@ -21,9 +21,20 @@ const fetchProductImages = (productIds) => {
           if (res.statusCode !== 200) return resolve({});
           const products = JSON.parse(data);
           const map = {};
-          products.forEach((p) => {
-            map[p.id] = p.images && p.images.length > 0 ? p.images[0].src : null;
-          });
+          if (Array.isArray(products)) {
+            products.forEach((p) => {
+              const catNames = Array.isArray(p.categories) ? p.categories.map((c) => c.name).filter(Boolean) : [];
+              const category = catNames.length > 0
+                ? (catNames.find((c) => /help book|solved assignment|combo/i.test(c)) || catNames[catNames.length - 1])
+                : "";
+              map[p.id] = {
+                image: p.images && p.images.length > 0 ? p.images[0].src : null,
+                sku: p.sku || "",
+                category,
+                categories: catNames,
+              };
+            });
+          }
           resolve(map);
         } catch {
           resolve({});
@@ -32,6 +43,7 @@ const fetchProductImages = (productIds) => {
     }).on("error", () => resolve({}));
   });
 };
+const fetchProductImages = fetchProductDetails;
 
 // Minimal GET-JSON helper against the live WooCommerce site (basic-auth bypass + query-string keys)
 const wcGetJson = (url) => {
@@ -865,7 +877,9 @@ async function buildOrdersPayload(orderRows) {
   });
 
   const metaValue = (itemMeta, key) => {
-    const m = itemMeta.find((im) => im.meta_key === key);
+    if (!key || !itemMeta) return null;
+    const target = key.toLowerCase();
+    const m = itemMeta.find((im) => (im.meta_key || "").toLowerCase() === target);
     return m ? m.meta_value : null;
   };
 
@@ -909,8 +923,8 @@ async function buildOrdersPayload(orderRows) {
     const quantity = int(metaValue(im, "_qty"));
     const subtotal = num(metaValue(im, "_line_subtotal"));
     const medium = resolveMedium(im);
-    const category = metaValue(im, "Category") || metaValue(im, "category") || "";
-    const code = metaValue(im, "Code") || metaValue(im, "code") || metaValue(im, "_sku") || metaValue(im, "sku") || "";
+    const category = metaValue(im, "Category") || metaValue(im, "category") || metaValue(im, "item_category") || "";
+    const code = metaValue(im, "Code") || metaValue(im, "code") || metaValue(im, "_sku") || metaValue(im, "sku") || metaValue(im, "item_code") || "";
     const variationId = int(metaValue(im, "_variation_id")) || int(metaValue(im, "variation_id")) || 0;
     const session = metaValue(im, "Session") || metaValue(im, "session") || metaValue(im, "pa_assignment-session") || metaValue(im, "assignment-session") || "";
     const type = metaValue(im, "Type") || metaValue(im, "type") || metaValue(im, "pa_assignment-type") || metaValue(im, "assignment-type") || "";
@@ -3061,11 +3075,19 @@ exports.getLocalOrderById = async (req, res) => {
 
     const [order] = await buildOrdersPayload(rows);
 
-    const productImages = await fetchProductImages(order.line_items.map((li) => li.product_id));
-    order.line_items = order.line_items.map((li) => ({
-      ...li,
-      image: productImages[li.product_id] || null,
-    }));
+    const productDetails = await fetchProductDetails(order.line_items.map((li) => li.product_id));
+    order.line_items = order.line_items.map((li) => {
+      const prod = productDetails[li.product_id] || {};
+      const category = li.category || prod.category || (prod.categories && prod.categories.length > 0 ? prod.categories.join(", ") : "") || "";
+      const code = li.code || li.sku || prod.sku || "";
+      return {
+        ...li,
+        image: prod.image || null,
+        category: category || li.category || "",
+        code: code || li.code || "",
+        sku: code || li.sku || null,
+      };
+    });
 
     // Order attribution, derived from the generic meta_data the order already carries
     const metaMap = {};
