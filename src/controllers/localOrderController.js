@@ -1190,15 +1190,18 @@ async function buildOrderListPayload(orderRows) {
     }
   });
 
-  // For orders on the current page missing _last_updated_user locally, check WooCommerce directly
-  const ordersMissingUser = orderRows.filter((o) => {
+  // For orders on the current page missing _last_updated_user or missing category locally, check WooCommerce directly
+  const ordersNeedingEnrichment = orderRows.filter((o) => {
     const meta = metaByOrder.get(o.id) || {};
-    return !meta["_last_updated_user"];
+    const cats = categoriesByOrder.get(o.id);
+    const hasUser = !!meta["_last_updated_user"];
+    const hasCategory = cats && cats.size > 0;
+    return !hasUser || !hasCategory;
   });
 
-  if (ordersMissingUser.length > 0 && ordersMissingUser.length <= 5) {
+  if (ordersNeedingEnrichment.length > 0 && ordersNeedingEnrichment.length <= 10) {
     await Promise.all(
-      ordersMissingUser.map(async (o) => {
+      ordersNeedingEnrichment.map(async (o) => {
         try {
           const wcOrderUrl = getApiUrl("orders", {}, o.id);
           const authHeader = getBasicAuthHeader();
@@ -1211,7 +1214,11 @@ async function buildOrderListPayload(orderRows) {
               });
             }).on("error", () => resolve(null));
           });
-          if (wcData && Array.isArray(wcData.meta_data)) {
+          if (!wcData) return;
+
+          // 1. Resolve _last_updated_user if missing
+          const meta = metaByOrder.get(o.id) || {};
+          if (!meta["_last_updated_user"] && Array.isArray(wcData.meta_data)) {
             const m = wcData.meta_data.find((item) => item.key === "_last_updated_user");
             if (m && m.value) {
               const valStr = String(m.value);
@@ -1231,6 +1238,43 @@ async function buildOrderListPayload(orderRows) {
                   ).catch(() => {});
                 }
               }).catch(() => {});
+            }
+          }
+
+          // 2. Resolve line items Category and Code if missing
+          const existingCats = categoriesByOrder.get(o.id);
+          if ((!existingCats || existingCats.size === 0) && Array.isArray(wcData.line_items) && wcData.line_items.length > 0) {
+            if (!categoriesByOrder.has(o.id)) categoriesByOrder.set(o.id, new Set());
+            const catSet = categoriesByOrder.get(o.id);
+
+            const prodIds = wcData.line_items.map((li) => li.product_id).filter(Boolean);
+            const prodDetails = prodIds.length > 0 ? await fetchProductDetails(prodIds) : {};
+
+            for (const item of wcData.line_items) {
+              const prod = prodDetails[item.product_id] || {};
+              const catMeta = Array.isArray(item.meta_data)
+                ? item.meta_data.find((m) => (m.key || "").toLowerCase() === "category")?.value
+                : null;
+              const category = catMeta || prod.category || (prod.categories && prod.categories.length > 0 ? prod.categories[prod.categories.length - 1] : "");
+              if (category) {
+                catSet.add(category);
+                pool.query(
+                  `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value)
+                   VALUES ($1, 'Category', $2)`,
+                  [item.id, category]
+                ).catch(() => {});
+              }
+
+              const codeMeta = item.sku || (Array.isArray(item.meta_data)
+                ? item.meta_data.find((m) => ["code", "sku", "_sku"].includes((m.key || "").toLowerCase()))?.value
+                : null) || prod.sku;
+              if (codeMeta) {
+                pool.query(
+                  `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value)
+                   VALUES ($1, 'Code', $2)`,
+                  [item.id, codeMeta]
+                ).catch(() => {});
+              }
             }
           }
         } catch {
@@ -1316,7 +1360,7 @@ async function buildOrderListPayload(orderRows) {
       shipping: buildAddress(addr.shipping, ["first_name", "last_name", "phone"]),
       payment_method: o.payment_method,
       payment_method_title: o.payment_method_title,
-      categories: categories && categories.size > 0 ? Array.from(categories).join(", ") : "IGNOU Help Books",
+      categories: categories && categories.size > 0 ? Array.from(categories).join(", ") : "—",
       origin: origin.charAt(0).toUpperCase() + origin.slice(1),
     };
   });
@@ -1925,9 +1969,14 @@ exports.createOrder = async (req, res) => {
         if (total !== undefined && !existingKeys.has("_line_total")) itemMetaList.push({ key: "_line_total", value: String(total) });
         if (subtotalTax !== undefined && !existingKeys.has("_line_subtotal_tax")) itemMetaList.push({ key: "_line_subtotal_tax", value: String(subtotalTax) });
         if (lineTax !== undefined && !existingKeys.has("_line_tax")) itemMetaList.push({ key: "_line_tax", value: String(lineTax) });
-        if (item.tax_class !== undefined && !existingKeys.has("_tax_class")) itemMetaList.push({ key: "_tax_class", value: item.tax_class || "" });
-        if (item.sku && !existingKeys.has("Code")) itemMetaList.push({ key: "Code", value: item.sku });
-        if (item.category && !existingKeys.has("Category")) itemMetaList.push({ key: "Category", value: item.category });
+        const itemSku = item.sku || item.product?.sku || item.code || "";
+        if (itemSku && !existingKeys.has("Code") && !existingKeys.has("code") && !existingKeys.has("sku") && !existingKeys.has("_sku")) {
+          itemMetaList.push({ key: "Code", value: String(itemSku) });
+        }
+        const itemCat = item.category || (Array.isArray(item.categories) ? item.categories[0] : (item.category_name || item.product?.category || (Array.isArray(item.product?.categories) ? item.product.categories[0]?.name || item.product.categories[0] : "")));
+        if (itemCat && !existingKeys.has("Category") && !existingKeys.has("category")) {
+          itemMetaList.push({ key: "Category", value: String(itemCat) });
+        }
 
         totalItemsSold += Number(qty) || 1;
         lineItemsForLookup.push({

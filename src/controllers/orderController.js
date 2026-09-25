@@ -195,7 +195,7 @@ exports.getOrders = async (req, res) => {
           (o.shipping_lines && o.shipping_lines.some(s => /same\s*day/i.test(s.method_title || s.method_id || ""))) ||
           /same\s*day/i.test(o.shipping_method || "")
         ),
-        categories: categories.length > 0 ? Array.from(new Set(categories)).join(", ") : "IGNOU Help Books", // Default category label fallback if none specified
+        categories: categories.length > 0 ? Array.from(new Set(categories)).join(", ") : "—",
         origin: origin.charAt(0).toUpperCase() + origin.slice(1)
       };
     });
