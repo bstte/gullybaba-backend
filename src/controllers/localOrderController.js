@@ -3182,20 +3182,83 @@ exports.getLocalOrderById = async (req, res) => {
       }
     }
 
-    // Customer order history, computed from the local orders table
-    if (order.customer_id) {
-      const statsRes = await pool.query(
-        `SELECT COUNT(*)::int AS total_orders, COALESCE(SUM(total_amount), 0) AS total_revenue
-         FROM gb_wc_orders WHERE customer_id = $1 AND type = 'shop_order' AND status NOT IN ('auto-draft', 'trash')`,
-        [order.customer_id]
-      );
-      const { total_orders, total_revenue } = statsRes.rows[0];
-      order.customer_stats = {
-        total_orders,
-        total_revenue: num(total_revenue),
-        average_order_value: total_orders > 0 ? (Number(total_revenue) / total_orders).toFixed(2) : "0.00",
-      };
-    } else {
+    // Customer order history, computed identical to WooCommerce CustomerHistory HPOS logic
+    const customerId = Number(order.customer_id) || 0;
+    const billingEmail = (order.billing && order.billing.email ? String(order.billing.email).trim() : "") ||
+                         (order.billing_email ? String(order.billing_email).trim() : "");
+
+    const excludedHistoryStatuses = [
+      "auto-draft",
+      "trash",
+      "wc-pending",
+      "pending",
+      "wc-failed",
+      "failed",
+      "wc-cancelled",
+      "cancelled",
+      "wc-checkout-draft",
+      "checkout-draft",
+    ];
+
+    try {
+      let statsRes = null;
+      if (customerId > 0) {
+        statsRes = await pool.query(
+          `SELECT COUNT(*)::int AS total_orders,
+                  (COALESCE(SUM(filtered.total_amount), 0) + COALESCE(SUM(r.refund_total), 0)) AS total_revenue
+           FROM (
+             SELECT id, total_amount
+             FROM gb_wc_orders
+             WHERE customer_id = $1 AND type = 'shop_order'
+               AND status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+           ) AS filtered
+           LEFT JOIN (
+             SELECT rp.parent_order_id, SUM(rp.total_amount) AS refund_total
+             FROM gb_wc_orders AS rp
+             INNER JOIN gb_wc_orders AS co ON rp.parent_order_id = co.id
+             WHERE rp.type = 'shop_order_refund'
+               AND co.customer_id = $1 AND co.type = 'shop_order'
+               AND co.status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+             GROUP BY rp.parent_order_id
+           ) AS r ON filtered.id = r.parent_order_id`,
+          [customerId, ...excludedHistoryStatuses]
+        );
+      } else if (billingEmail) {
+        statsRes = await pool.query(
+          `SELECT COUNT(*)::int AS total_orders,
+                  (COALESCE(SUM(filtered.total_amount), 0) + COALESCE(SUM(r.refund_total), 0)) AS total_revenue
+           FROM (
+             SELECT id, total_amount
+             FROM gb_wc_orders
+             WHERE (customer_id = 0 OR customer_id IS NULL) AND billing_email = $1 AND type = 'shop_order'
+               AND status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+           ) AS filtered
+           LEFT JOIN (
+             SELECT rp.parent_order_id, SUM(rp.total_amount) AS refund_total
+             FROM gb_wc_orders AS rp
+             INNER JOIN gb_wc_orders AS co ON rp.parent_order_id = co.id
+             WHERE rp.type = 'shop_order_refund'
+               AND (co.customer_id = 0 OR co.customer_id IS NULL) AND co.billing_email = $1 AND co.type = 'shop_order'
+               AND co.status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+             GROUP BY rp.parent_order_id
+           ) AS r ON filtered.id = r.parent_order_id`,
+          [billingEmail, ...excludedHistoryStatuses]
+        );
+      }
+
+      if (statsRes && statsRes.rows && statsRes.rows.length > 0) {
+        const total_orders = parseInt(statsRes.rows[0].total_orders, 10) || 0;
+        const total_revenue = parseFloat(statsRes.rows[0].total_revenue) || 0;
+        order.customer_stats = {
+          total_orders,
+          total_revenue: num(total_revenue),
+          average_order_value: total_orders > 0 ? (total_revenue / total_orders).toFixed(2) : "0.00",
+        };
+      } else {
+        order.customer_stats = { total_orders: 0, total_revenue: "0.00", average_order_value: "0.00" };
+      }
+    } catch (statsErr) {
+      console.error("Error computing customer order history stats:", statsErr);
       order.customer_stats = { total_orders: 0, total_revenue: "0.00", average_order_value: "0.00" };
     }
 
