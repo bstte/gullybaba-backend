@@ -1058,6 +1058,8 @@ async function buildOrdersPayload(orderRows) {
       deliveredBy = "TekiPost";
     } else if (oMeta["dtdc_status"] === "Sent" || oMeta["_dtdc_reference_number"]) {
       deliveredBy = "DTDC";
+    } else if (oMeta["_speed_post"] === "yes" || oMeta["_speed_tracking_id"]) {
+      deliveredBy = "Speed Post";
     }
 
     const updatedUserId = oMeta["_last_updated_user"] ? parseInt(oMeta["_last_updated_user"], 10) : null;
@@ -1318,7 +1320,7 @@ async function buildOrderListPayload(orderRows) {
     }
     const isSameDay = !!(isSameDayByOrder.get(o.id) || /same\s*day/i.test(shippingByOrder.get(o.id) || ""));
 
-    // Delivered By: Shiprocket, TekiPost, DTDC
+    // Delivered By: Shiprocket, TekiPost, DTDC, Speed Post
     let deliveredBy = "";
     if (meta["shiprocket_status"] === "Sent") {
       deliveredBy = "Shiprocket";
@@ -1326,6 +1328,8 @@ async function buildOrderListPayload(orderRows) {
       deliveredBy = "TekiPost";
     } else if (meta["dtdc_status"] === "Sent" || meta["_dtdc_reference_number"]) {
       deliveredBy = "DTDC";
+    } else if (meta["_speed_post"] === "yes" || meta["_speed_tracking_id"]) {
+      deliveredBy = "Speed Post";
     }
 
     // Update By: user who last updated the order
@@ -2258,18 +2262,20 @@ exports.updateOrder = async (req, res) => {
 
   // Detect whether this is a webhook/server-to-server call from WordPress
   const webhookSecret = process.env.ORDER_WEBHOOK_SECRET || "gullybaba_order_webhook_2026";
+  const headers = req.headers || {};
+  const query = req.query || {};
   const providedSecret =
-    req.headers["x-webhook-secret"] ||
-    req.headers["x-wc-webhook-secret"] ||
-    req.query.secret ||
-    req.query.webhook_secret ||
+    headers["x-webhook-secret"] ||
+    headers["x-wc-webhook-secret"] ||
+    query.secret ||
+    query.webhook_secret ||
     body.webhook_secret ||
     body.secret;
 
   const isWebhookFromWordPress =
     (providedSecret && providedSecret === webhookSecret) ||
     req.isWebhook === true ||
-    req.headers["x-wc-webhook-topic"] ||
+    headers["x-wc-webhook-topic"] ||
     body.from_wordpress === true;
 
   const shouldSyncToWordPress = !isWebhookFromWordPress && body.sync_to_wordpress !== false;
@@ -2382,10 +2388,19 @@ exports.updateOrder = async (req, res) => {
       rawMeta = Object.entries(body.meta_data).map(([key, value]) => ({ key, value }));
     }
 
+    // Normalize speed post shortcut keys
+    if (body.speed_post !== undefined && body._speed_post === undefined) {
+      body._speed_post = body.speed_post;
+    }
+    if (body.speed_tracking_id !== undefined && body._speed_tracking_id === undefined) {
+      body._speed_tracking_id = body.speed_tracking_id;
+    }
+
     // Shortcut fields
     const shortcutMeta = [
       "_last_updated_user", "last_updated_user", "updated_by", "updated_by_id", "user_id",
-      "shiprocket_status", "tekipost_status", "dtdc_status", "_dtdc_reference_number", "payment_type"
+      "shiprocket_status", "tekipost_status", "dtdc_status", "_dtdc_reference_number", "payment_type",
+      "_speed_post", "_speed_tracking_id"
     ];
     for (const sk of shortcutMeta) {
       if (body[sk] !== undefined && body[sk] !== null && !rawMeta.some((m) => (m.key || m.meta_key) === sk)) {
@@ -2837,6 +2852,40 @@ exports.syncOrderStatus = async (req, res) => {
       }
     }
 
+    // 6. Also sync any courier / speed post metadata passed in webhook body or meta_data
+    let incomingMeta = [];
+    if (Array.isArray(body.meta_data)) incomingMeta = [...body.meta_data];
+    else if (Array.isArray(body.meta)) incomingMeta = [...body.meta];
+    const syncKeys = [
+      "shiprocket_status", "tekipost_status", "dtdc_status", "_dtdc_reference_number",
+      "_speed_post", "_speed_tracking_id", "speed_post", "speed_tracking_id",
+      "_tekipost_awb", "_tekipost_courier_name", "_shiprocket_awb_code", "_shiprocket_courier_name"
+    ];
+    for (const k of syncKeys) {
+      if (body[k] !== undefined && body[k] !== null && !incomingMeta.some((m) => (m.key || m.meta_key) === k)) {
+        incomingMeta.push({ key: k, value: body[k] });
+      }
+    }
+    for (const m of incomingMeta) {
+      let mk = m.key || m.meta_key;
+      if (mk === "speed_post") mk = "_speed_post";
+      if (mk === "speed_tracking_id") mk = "_speed_tracking_id";
+      const mv = m.value !== undefined ? m.value : m.meta_value;
+      if (mk && mv !== undefined && mv !== null) {
+        const strVal = typeof mv === "object" ? JSON.stringify(mv) : String(mv);
+        const updRes = await client.query(
+          `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = $3`,
+          [strVal, orderId, mk]
+        );
+        if (updRes.rowCount === 0) {
+          await client.query(
+            `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+            [orderId, mk, strVal]
+          ).catch(() => {});
+        }
+      }
+    }
+
     await client.query("COMMIT");
 
     console.log(`[order-status-sync] order #${orderId} status updated to ${status} via WordPress webhook`);
@@ -3109,7 +3158,21 @@ exports.getLocalOrders = async (req, res) => {
 // GET /api/orders/local/:id
 exports.getLocalOrderById = async (req, res) => {
   try {
-    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    let rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      try {
+        const wcOrder = await wcGetJson(getApiUrl("orders", {}, req.params.id));
+        if (wcOrder && wcOrder.id) {
+          await new Promise((resolve) => {
+            const fakeRes = { status: () => fakeRes, json: resolve };
+            exports.createOrder({ body: wcOrder }, fakeRes).catch(() => resolve());
+          });
+          rows = await fetchOrderRows("id = $1", [req.params.id]);
+        }
+      } catch (err) {
+        // Fall through
+      }
+    }
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: "Order not found" });
     }
@@ -3158,28 +3221,66 @@ exports.getLocalOrderById = async (req, res) => {
       referrer: metaMap["_wc_order_attribution_referrer"] || "",
     };
 
-    // If DTDC reference number is missing locally, check WooCommerce to backfill it
-    if (!metaMap["_dtdc_reference_number"]) {
+    // Courier & Speed Post sync: if any courier status or tracking is missing locally, check WooCommerce to backfill
+    const courierSyncKeys = [
+      "_dtdc_reference_number",
+      "dtdc_status",
+      "tekipost_status",
+      "shiprocket_status",
+      "_speed_post",
+      "_speed_tracking_id",
+      "_tekipost_awb",
+      "_tekipost_courier_name",
+      "_tekipost_c_status",
+      "_shiprocket_awb_code",
+      "_shiprocket_courier_name",
+      "_shiprocket_pickup_date",
+      "_shiprocket_order_status",
+    ];
+
+    const needsCourierSync = courierSyncKeys.some((k) => !metaMap[k]);
+    if (needsCourierSync) {
       try {
         const wcOrder = await wcGetJson(getApiUrl("orders", {}, order.id));
-        const ref = wcOrder?.meta_data?.find((m) => m.key === "_dtdc_reference_number")?.value;
-        if (ref) {
-          metaMap["_dtdc_reference_number"] = ref;
-          order.meta_data.push({ key: "_dtdc_reference_number", value: ref });
-          const updateRes = await pool.query(
-            `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_dtdc_reference_number'`,
-            [ref, order.id]
-          );
-          if (updateRes.rowCount === 0) {
-            await pool.query(
-              `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_dtdc_reference_number', $2)`,
-              [order.id, ref]
-            ).catch(() => { });
+        if (wcOrder && Array.isArray(wcOrder.meta_data)) {
+          for (const k of courierSyncKeys) {
+            const wcMeta = wcOrder.meta_data.find((m) => m.key === k);
+            if (wcMeta && wcMeta.value !== undefined && wcMeta.value !== null && wcMeta.value !== "") {
+              const valStr = typeof wcMeta.value === "object" ? JSON.stringify(wcMeta.value) : String(wcMeta.value);
+              metaMap[k] = valStr;
+              const existingIdx = order.meta_data.findIndex((m) => m.key === k);
+              if (existingIdx >= 0) {
+                order.meta_data[existingIdx].value = valStr;
+              } else {
+                order.meta_data.push({ id: wcMeta.id || 0, key: k, value: valStr });
+              }
+              const updateRes = await pool.query(
+                `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = $3`,
+                [valStr, order.id, k]
+              );
+              if (updateRes.rowCount === 0) {
+                await pool.query(
+                  `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+                  [order.id, k, valStr]
+                ).catch(() => {});
+              }
+            }
           }
         }
       } catch (wcErr) {
         // Non-blocking
       }
+    }
+
+    // Recompute delivered_by based on refreshed metadata
+    if (metaMap["shiprocket_status"] === "Sent") {
+      order.delivered_by = "Shiprocket";
+    } else if (metaMap["tekipost_status"] === "Sent") {
+      order.delivered_by = "TekiPost";
+    } else if (metaMap["dtdc_status"] === "Sent" || metaMap["_dtdc_reference_number"]) {
+      order.delivered_by = "DTDC";
+    } else if (metaMap["_speed_post"] === "yes" || metaMap["_speed_tracking_id"]) {
+      order.delivered_by = "Speed Post";
     }
 
     // Customer order history, computed identical to WooCommerce CustomerHistory HPOS logic
@@ -3781,7 +3882,10 @@ async function markOrderSentToDtdc(orderId, referenceNumber) {
 function extractDtdcReference(obj) {
   if (!obj) return "";
   if (typeof obj === "string") {
-    if (/^[A-Z0-9]{8,20}$/i.test(obj.trim())) return obj.trim();
+    const trimmed = obj.trim();
+    if (/^[A-Z0-9]{8,20}$/i.test(trimmed)) return trimmed;
+    const match = trimmed.match(/\b([A-Z0-9]{2,4}\d{6,14})\b/i) || trimmed.match(/\b(7[A-Z0-9]{8,15})\b/i);
+    if (match) return match[1];
     return "";
   }
   if (Array.isArray(obj)) {
@@ -3794,6 +3898,8 @@ function extractDtdcReference(obj) {
     if (obj.consignment_no) return String(obj.consignment_no).trim();
     if (obj.awb_no) return String(obj.awb_no).trim();
     if (obj.awb) return String(obj.awb).trim();
+    if (obj.track_id) return String(obj.track_id).trim();
+    if (obj.tracking_id) return String(obj.tracking_id).trim();
     for (const key of Object.keys(obj)) {
       const found = extractDtdcReference(obj[key]);
       if (found) return found;
@@ -3924,13 +4030,19 @@ exports.sendToDtdc = async (req, res) => {
       });
     }
 
-    // If WordPress reported success but referenceNumber was not extracted, fetch it directly from WooCommerce
+    // If WordPress reported success but referenceNumber was not extracted, fetch it directly from WooCommerce (retry up to 3 times)
     if (!referenceNumber) {
-      try {
-        const wcOrder = await wcGetJson(getApiUrl("orders", {}, order.id));
-        referenceNumber = wcOrder?.meta_data?.find((m) => m.key === "_dtdc_reference_number")?.value || "";
-      } catch (wcErr) {
-        console.warn(`[dtdc] Failed to fetch WC order meta for order #${order.id}:`, wcErr.message);
+      for (let attempt = 0; attempt < 3; attempt++) {
+        if (attempt > 0) {
+          await new Promise((r) => setTimeout(r, 1000));
+        }
+        try {
+          const wcOrder = await wcGetJson(getApiUrl("orders", {}, order.id));
+          referenceNumber = wcOrder?.meta_data?.find((m) => m.key === "_dtdc_reference_number")?.value || "";
+          if (referenceNumber) break;
+        } catch (wcErr) {
+          console.warn(`[dtdc] Failed to fetch WC order meta for order #${order.id}:`, wcErr.message);
+        }
       }
     }
 

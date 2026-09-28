@@ -59,8 +59,8 @@ router.post("/create", checkWebhookSecret, localOrderController.createOrder);
 router.post("/update", checkWebhookSecret, localOrderController.updateOrder);
 
 // Called from Admin Panel / API Client to update an entire order or order fields
-router.put("/:id", authMiddleware, checkOrdersAccess, checkEditUserDetail, localOrderController.updateFullOrder);
-router.post("/:id", authMiddleware, checkOrdersAccess, checkEditUserDetail, localOrderController.updateFullOrder);
+router.put("/:id", authMiddleware, checkOrdersAccess, localOrderController.updateFullOrder);
+router.post("/:id", authMiddleware, checkOrdersAccess, localOrderController.updateFullOrder);
 
 // Called FROM WordPress when order status is changed on WooCommerce — server-to-server,
 // gated by shared secret (x-webhook-secret header, ?secret= query param, or secret in body).
