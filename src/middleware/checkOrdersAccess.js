@@ -13,6 +13,7 @@ function requireOrderPermission(requiredValue, deniedMessage) {
 
       if (customer.role === "administrator") {
         req.allowedStatuses = null;
+        req.accessOrders = null;
         return next();
       }
 
@@ -24,9 +25,10 @@ function requireOrderPermission(requiredValue, deniedMessage) {
       }
 
       const allowedStatusValues = values
-        .filter((v) => typeof v === "string" && v.startsWith("wc-"))
+        .filter((v) => typeof v === "string" && v.startsWith("wc-") && !v.startsWith("wc-custom-filter-"))
         .map((v) => v.replace(/^wc-/, ""));
       req.allowedStatuses = allowedStatusValues;
+      req.accessOrders = values;
 
       next();
     } catch (error) {

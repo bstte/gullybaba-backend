@@ -1483,16 +1483,16 @@ exports.getOrders = async (req, res) => {
     const payment_method = req.query.payment_method || "";
 
     // Normalize special filter tabs passed as status
-    if (status === "handwritten-scan-copy" || status === "Handwritten Scan Copy" || status === "demand_scan") {
+    if (status === "handwritten-scan-copy" || status === "Handwritten Scan Copy" || status === "demand_scan" || status === "wc-custom-filter-1" || status === "custom-filter-1") {
       demand_type_filter = "Handwritten Scan Copy";
       status = "";
-    } else if (status === "handwritten-hard-copy-via-courier" || status === "Handwritten Hard Copy Via Courier" || status === "demand_hard") {
+    } else if (status === "handwritten-hard-copy-via-courier" || status === "Handwritten Hard Copy Via Courier" || status === "demand_hard" || status === "wc-custom-filter-2" || status === "custom-filter-2") {
       demand_type_filter = "Handwritten Hard Copy Via Courier";
       status = "";
-    } else if (status === "assignment-not-available" || status === "Assignment Not Available" || status === "demand_not_available") {
+    } else if (status === "assignment-not-available" || status === "Assignment Not Available" || status === "demand_not_available" || status === "wc-custom-filter-4" || status === "custom-filter-4") {
       demand_type_filter = "1";
       status = "";
-    } else if (status === "speed-post" || status === "speed_post" || status === "Speed Post") {
+    } else if (status === "speed-post" || status === "speed_post" || status === "Speed Post" || status === "wc-custom-filter-3" || status === "custom-filter-3") {
       speed_post = "yes";
       status = "";
     }
@@ -1501,6 +1501,26 @@ exports.getOrders = async (req, res) => {
     const params = [];
 
     const isRestricted = Array.isArray(req.allowedStatuses);
+
+    // Custom filter permissions from ACF:
+    // wc-custom-filter-1 -> Handwritten Scan Copy
+    // wc-custom-filter-2 -> Handwritten Hard Copy Via Courier
+    // wc-custom-filter-3 -> Speed Post
+    // wc-custom-filter-4 -> Assignment Not Available
+    if (isRestricted && Array.isArray(req.accessOrders)) {
+      if (demand_type_filter === "Handwritten Scan Copy" && !req.accessOrders.includes("wc-custom-filter-1")) {
+        conditions.push("1 = 0");
+      }
+      if (demand_type_filter === "Handwritten Hard Copy Via Courier" && !req.accessOrders.includes("wc-custom-filter-2")) {
+        conditions.push("1 = 0");
+      }
+      if ((speed_post === "yes" || speed_post === "1") && !req.accessOrders.includes("wc-custom-filter-3")) {
+        conditions.push("1 = 0");
+      }
+      if (demand_type_filter === "1" && !req.accessOrders.includes("wc-custom-filter-4")) {
+        conditions.push("1 = 0");
+      }
+    }
 
     if (status && status !== "all") {
       if (status === "trash") {
