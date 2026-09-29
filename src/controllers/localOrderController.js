@@ -3291,10 +3291,6 @@ exports.getLocalOrderById = async (req, res) => {
     const excludedHistoryStatuses = [
       "auto-draft",
       "trash",
-      "wc-pending",
-      "pending",
-      "wc-failed",
-      "failed",
       "wc-cancelled",
       "cancelled",
       "wc-checkout-draft",
@@ -3302,61 +3298,85 @@ exports.getLocalOrderById = async (req, res) => {
     ];
 
     try {
-      let statsRes = null;
+      let statsFound = false;
+
+      // 1. First, if customerId > 0, check live WooCommerce order history for this customer
       if (customerId > 0) {
-        statsRes = await pool.query(
-          `SELECT COUNT(*)::int AS total_orders,
-                  (COALESCE(SUM(filtered.total_amount), 0) + COALESCE(SUM(r.refund_total), 0)) AS total_revenue
-           FROM (
-             SELECT id, total_amount
-             FROM gb_wc_orders
-             WHERE customer_id = $1 AND type = 'shop_order'
-               AND status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
-           ) AS filtered
-           LEFT JOIN (
-             SELECT rp.parent_order_id, SUM(rp.total_amount) AS refund_total
-             FROM gb_wc_orders AS rp
-             INNER JOIN gb_wc_orders AS co ON rp.parent_order_id = co.id
-             WHERE rp.type = 'shop_order_refund'
-               AND co.customer_id = $1 AND co.type = 'shop_order'
-               AND co.status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
-             GROUP BY rp.parent_order_id
-           ) AS r ON filtered.id = r.parent_order_id`,
-          [customerId, ...excludedHistoryStatuses]
-        );
-      } else if (billingEmail) {
-        statsRes = await pool.query(
-          `SELECT COUNT(*)::int AS total_orders,
-                  (COALESCE(SUM(filtered.total_amount), 0) + COALESCE(SUM(r.refund_total), 0)) AS total_revenue
-           FROM (
-             SELECT id, total_amount
-             FROM gb_wc_orders
-             WHERE (customer_id = 0 OR customer_id IS NULL) AND billing_email = $1 AND type = 'shop_order'
-               AND status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
-           ) AS filtered
-           LEFT JOIN (
-             SELECT rp.parent_order_id, SUM(rp.total_amount) AS refund_total
-             FROM gb_wc_orders AS rp
-             INNER JOIN gb_wc_orders AS co ON rp.parent_order_id = co.id
-             WHERE rp.type = 'shop_order_refund'
-               AND (co.customer_id = 0 OR co.customer_id IS NULL) AND co.billing_email = $1 AND co.type = 'shop_order'
-               AND co.status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
-             GROUP BY rp.parent_order_id
-           ) AS r ON filtered.id = r.parent_order_id`,
-          [billingEmail, ...excludedHistoryStatuses]
-        );
+        try {
+          const wcOrders = await wcGetJson(getApiUrl("orders", { customer: customerId, per_page: 100 }));
+          if (Array.isArray(wcOrders) && wcOrders.length > 0) {
+            const validOrders = wcOrders.filter((o) => !["cancelled", "trash", "auto-draft", "checkout-draft"].includes(o.status));
+            const total_orders = validOrders.length;
+            const total_revenue = validOrders.reduce((sum, o) => sum + parseFloat(o.total || "0"), 0);
+            order.customer_stats = {
+              total_orders,
+              total_revenue: num(total_revenue),
+              average_order_value: total_orders > 0 ? (total_revenue / total_orders).toFixed(2) : "0.00",
+            };
+            statsFound = true;
+          }
+        } catch (wcCustErr) {
+          // Fall back to local database query
+        }
       }
 
-      if (statsRes && statsRes.rows && statsRes.rows.length > 0) {
-        const total_orders = parseInt(statsRes.rows[0].total_orders, 10) || 0;
-        const total_revenue = parseFloat(statsRes.rows[0].total_revenue) || 0;
-        order.customer_stats = {
-          total_orders,
-          total_revenue: num(total_revenue),
-          average_order_value: total_orders > 0 ? (total_revenue / total_orders).toFixed(2) : "0.00",
-        };
-      } else {
-        order.customer_stats = { total_orders: 0, total_revenue: "0.00", average_order_value: "0.00" };
+      if (!statsFound) {
+        let statsRes = null;
+        if (customerId > 0) {
+          statsRes = await pool.query(
+            `SELECT COUNT(*)::int AS total_orders,
+                    (COALESCE(SUM(filtered.total_amount), 0) + COALESCE(SUM(r.refund_total), 0)) AS total_revenue
+             FROM (
+               SELECT id, total_amount
+               FROM gb_wc_orders
+               WHERE customer_id = $1 AND type = 'shop_order'
+                 AND status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+             ) AS filtered
+             LEFT JOIN (
+               SELECT rp.parent_order_id, SUM(rp.total_amount) AS refund_total
+               FROM gb_wc_orders AS rp
+               INNER JOIN gb_wc_orders AS co ON rp.parent_order_id = co.id
+               WHERE rp.type = 'shop_order_refund'
+                 AND co.customer_id = $1 AND co.type = 'shop_order'
+                 AND co.status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+               GROUP BY rp.parent_order_id
+             ) AS r ON filtered.id = r.parent_order_id`,
+            [customerId, ...excludedHistoryStatuses]
+          );
+        } else if (billingEmail) {
+          statsRes = await pool.query(
+            `SELECT COUNT(*)::int AS total_orders,
+                    (COALESCE(SUM(filtered.total_amount), 0) + COALESCE(SUM(r.refund_total), 0)) AS total_revenue
+             FROM (
+               SELECT id, total_amount
+               FROM gb_wc_orders
+               WHERE (customer_id = 0 OR customer_id IS NULL) AND billing_email = $1 AND type = 'shop_order'
+                 AND status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+             ) AS filtered
+             LEFT JOIN (
+               SELECT rp.parent_order_id, SUM(rp.total_amount) AS refund_total
+               FROM gb_wc_orders AS rp
+               INNER JOIN gb_wc_orders AS co ON rp.parent_order_id = co.id
+               WHERE rp.type = 'shop_order_refund'
+                 AND (co.customer_id = 0 OR co.customer_id IS NULL) AND co.billing_email = $1 AND co.type = 'shop_order'
+                 AND co.status NOT IN (${excludedHistoryStatuses.map((_, i) => `$${i + 2}`).join(", ")})
+               GROUP BY rp.parent_order_id
+             ) AS r ON filtered.id = r.parent_order_id`,
+            [billingEmail, ...excludedHistoryStatuses]
+          );
+        }
+
+        if (statsRes && statsRes.rows && statsRes.rows.length > 0) {
+          const total_orders = parseInt(statsRes.rows[0].total_orders, 10) || 0;
+          const total_revenue = parseFloat(statsRes.rows[0].total_revenue) || 0;
+          order.customer_stats = {
+            total_orders,
+            total_revenue: num(total_revenue),
+            average_order_value: total_orders > 0 ? (total_revenue / total_orders).toFixed(2) : "0.00",
+          };
+        } else {
+          order.customer_stats = { total_orders: 0, total_revenue: "0.00", average_order_value: "0.00" };
+        }
       }
     } catch (statsErr) {
       console.error("Error computing customer order history stats:", statsErr);
