@@ -1384,15 +1384,20 @@ exports.getStatusCounts = async (req, res) => {
     rows.forEach((r) => {
       const value = stripStatusPrefix(r.status) || r.status;
       counts[value] = (counts[value] || 0) + r.count;
-      if (!isRestricted || req.allowedStatuses.includes(value)) {
-        total += r.count;
+      if (value !== "trash" && value !== "auto-draft") {
+        if (!isRestricted || req.allowedStatuses.includes(value)) {
+          total += r.count;
+        }
       }
     });
 
     const knownValues = new Set(STATUS_LIST.map((s) => s.value));
     const extraStatuses = Object.keys(counts)
-      .filter((v) => !knownValues.has(v))
-      .map((v) => ({ value: v, label: v.charAt(0).toUpperCase() + v.slice(1).replace(/-/g, " ") }));
+      .filter((v) => !knownValues.has(v) && v !== "auto-draft")
+      .map((v) => ({
+        value: v,
+        label: v === "trash" ? "Trash" : v.charAt(0).toUpperCase() + v.slice(1).replace(/-/g, " "),
+      }));
 
     const fullStatusList = [...STATUS_LIST, ...extraStatuses];
     const statusList = isRestricted
@@ -1466,7 +1471,9 @@ exports.getOrders = async (req, res) => {
     const page = Math.max(parseInt(req.query.page, 10) || 1, 1);
     const limit = Math.min(parseInt(req.query.limit, 10) || 20, 100);
     const search = (req.query.search || "").trim();
-    const status = req.query.status || "";
+    let status = req.query.status || "";
+    let demand_type_filter = req.query.demand_type_filter || "";
+    let speed_post = req.query.speed_post || "";
     const start_date = req.query.start_date || "";
     const end_date = req.query.end_date || "";
     const categories = (req.query.category || "")
@@ -1475,29 +1482,94 @@ exports.getOrders = async (req, res) => {
       .filter(Boolean);
     const payment_method = req.query.payment_method || "";
 
+    // Normalize special filter tabs passed as status
+    if (status === "handwritten-scan-copy" || status === "Handwritten Scan Copy" || status === "demand_scan") {
+      demand_type_filter = "Handwritten Scan Copy";
+      status = "";
+    } else if (status === "handwritten-hard-copy-via-courier" || status === "Handwritten Hard Copy Via Courier" || status === "demand_hard") {
+      demand_type_filter = "Handwritten Hard Copy Via Courier";
+      status = "";
+    } else if (status === "assignment-not-available" || status === "Assignment Not Available" || status === "demand_not_available") {
+      demand_type_filter = "1";
+      status = "";
+    } else if (status === "speed-post" || status === "speed_post" || status === "Speed Post") {
+      speed_post = "yes";
+      status = "";
+    }
+
     const conditions = ["o.type = 'shop_order'"];
     const params = [];
 
     const isRestricted = Array.isArray(req.allowedStatuses);
 
     if (status && status !== "all") {
-      if (isRestricted && !req.allowedStatuses.includes(status)) {
+      if (status === "trash") {
+        conditions.push(`o.status IN ('trash', 'wc-trash')`);
+      } else if (isRestricted && !req.allowedStatuses.includes(status)) {
         conditions.push("1 = 0");
       } else {
         params.push(status, `wc-${status}`);
         conditions.push(`o.status IN ($${params.length - 1}, $${params.length})`);
       }
-    } else if (isRestricted) {
-      if (req.allowedStatuses.length === 0) {
-        conditions.push("1 = 0");
-      } else {
-        const allowedFull = [];
-        req.allowedStatuses.forEach((s) => {
-          allowedFull.push(s, `wc-${s}`);
-        });
-        params.push(allowedFull);
-        conditions.push(`o.status = ANY($${params.length})`);
+    } else {
+      conditions.push(`o.status NOT IN ('trash', 'wc-trash', 'auto-draft')`);
+      if (isRestricted) {
+        if (req.allowedStatuses.length === 0) {
+          conditions.push("1 = 0");
+        } else {
+          const allowedFull = [];
+          req.allowedStatuses.forEach((s) => {
+            allowedFull.push(s, `wc-${s}`);
+          });
+          params.push(allowedFull);
+          conditions.push(`o.status = ANY($${params.length})`);
+        }
       }
+    }
+
+    if (demand_type_filter) {
+      if (demand_type_filter === "1") {
+        conditions.push(
+          `EXISTS (
+            SELECT 1 FROM gb_woocommerce_order_items oi
+            JOIN gb_woocommerce_order_itemmeta im ON im.order_item_id = oi.order_item_id
+            WHERE oi.order_id = o.id AND oi.order_item_type = 'line_item'
+              AND lower(im.meta_key) = 'other' AND im.meta_value = '1'
+          )
+          AND NOT EXISTS (
+            SELECT 1 FROM gb_woocommerce_order_items oi2
+            JOIN gb_woocommerce_order_itemmeta im2 ON im2.order_item_id = oi2.order_item_id
+            WHERE oi2.order_id = o.id AND im2.meta_key = '_variation_id'
+              AND COALESCE(NULLIF(regexp_replace(im2.meta_value, '[^0-9]', '', 'g'), ''), '0')::bigint > 0
+          )`
+        );
+      } else {
+        params.push(demand_type_filter);
+        conditions.push(
+          `EXISTS (
+            SELECT 1 FROM gb_woocommerce_order_items oi
+            JOIN gb_woocommerce_order_itemmeta im ON im.order_item_id = oi.order_item_id
+            WHERE oi.order_id = o.id AND oi.order_item_type = 'line_item'
+              AND lower(im.meta_key) = 'demand' AND im.meta_value ILIKE $${params.length}
+          )`
+        );
+      }
+    }
+
+    if (speed_post === "yes" || speed_post === "1") {
+      conditions.push(
+        `(
+          EXISTS (
+            SELECT 1 FROM gb_wc_orders_meta om
+            WHERE om.order_id = o.id AND om.meta_key = '_speed_post' AND lower(om.meta_value) = 'yes'
+          )
+          OR
+          EXISTS (
+            SELECT 1 FROM gb_woocommerce_order_items oi
+            WHERE oi.order_id = o.id AND oi.order_item_name ILIKE '%Speed Post%'
+          )
+        )`
+      );
     }
 
     if (payment_method && payment_method !== "all") {
