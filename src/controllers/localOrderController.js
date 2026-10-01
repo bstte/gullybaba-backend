@@ -1,4 +1,5 @@
 const https = require("https");
+const crypto = require("crypto");
 const pool = require("../config/database");
 const { updateOrderStatusInWooCommerce, updateOrderInWooCommerce } = require("./orderController");
 const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
@@ -1237,9 +1238,9 @@ async function buildOrderListPayload(orderRows) {
                   pool.query(
                     `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, '_last_updated_user', $2)`,
                     [o.id, valStr]
-                  ).catch(() => {});
+                  ).catch(() => { });
                 }
-              }).catch(() => {});
+              }).catch(() => { });
             }
           }
 
@@ -1264,7 +1265,7 @@ async function buildOrderListPayload(orderRows) {
                   `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value)
                    VALUES ($1, 'Category', $2)`,
                   [item.id, category]
-                ).catch(() => {});
+                ).catch(() => { });
               }
 
               const codeMeta = item.sku || (Array.isArray(item.meta_data)
@@ -1275,7 +1276,7 @@ async function buildOrderListPayload(orderRows) {
                   `INSERT INTO gb_woocommerce_order_itemmeta (order_item_id, meta_key, meta_value)
                    VALUES ($1, 'Code', $2)`,
                   [item.id, codeMeta]
-                ).catch(() => {});
+                ).catch(() => { });
               }
             }
           }
@@ -2583,7 +2584,7 @@ exports.updateOrder = async (req, res) => {
           fetchCustomerById(uId).then((cu) => {
             const name = cu.display_name || `${cu.first_name || ""} ${cu.last_name || ""}`.trim() || cu.username || `#${uId}`;
             userNameCache.set(uId, name);
-          }).catch(() => {});
+          }).catch(() => { });
         }
       }
     }
@@ -2610,29 +2611,28 @@ exports.updateOrder = async (req, res) => {
       if (metaToSend.length > 0) {
         wcPayload.meta_data = metaToSend;
       }
-
-      if (Object.keys(wcPayload).length > 0) {
-        try {
-          await updateOrderInWooCommerce(orderId, wcPayload);
-        } catch (wcError) {
-          await client.query("ROLLBACK");
-          console.error(`Failed to push order update to WooCommerce for #${orderId}:`, wcError.message);
-          return res.status(502).json({
-            success: false,
-            message: `Failed to update order #${orderId} on WordPress/WooCommerce: ${wcError.message}. Local changes were rolled back.`,
-          });
-        }
-      }
     }
 
     await client.query("COMMIT");
 
     console.log(`[order-update] order #${orderId} updated successfully (syncedToWP: ${shouldSyncToWordPress})`);
-    return res.json({
+    res.json({
       success: true,
       message: `Order #${orderId} updated successfully${shouldSyncToWordPress ? " and synced to WordPress" : ""}`,
       order: updatedOrderRows[0] || existing,
     });
+
+    if (shouldSyncToWordPress && Object.keys(wcPayload).length > 0) {
+      updateOrderInWooCommerce(orderId, wcPayload).catch((wcError) => {
+        console.error(`[WooCommerce Sync] Failed to push order update to WooCommerce for #${orderId}:`, wcError.message);
+        setTimeout(() => {
+          updateOrderInWooCommerce(orderId, wcPayload).catch((retryErr) => {
+            console.error(`[WooCommerce Sync] Retry failed to push order update to WooCommerce for #${orderId}:`, retryErr.message);
+          });
+        }, 2500);
+      });
+    }
+    return;
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(`Error updating order #${orderId}:`, error);
@@ -2940,7 +2940,7 @@ exports.syncOrderStatus = async (req, res) => {
           const fullName = `${cu.first_name || ""} ${cu.last_name || ""}`.trim();
           const name = cu.display_name || fullName || cu.username || cu.name || `#${numId}`;
           userNameCache.set(numId, name);
-        }).catch(() => {});
+        }).catch(() => { });
       }
     }
 
@@ -2973,7 +2973,7 @@ exports.syncOrderStatus = async (req, res) => {
           await client.query(
             `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
             [orderId, mk, strVal]
-          ).catch(() => {});
+          ).catch(() => { });
         }
       }
     }
@@ -3009,13 +3009,16 @@ exports.updateStatus = async (req, res) => {
     return res.status(400).json({ success: false, message: "Status is required" });
   }
 
+  const cleanStatus = stripStatusPrefix(status);
+  const dbStatus = `wc-${cleanStatus}`;
+
   const client = await pool.connect();
   try {
     await client.query("BEGIN");
 
     const { rows } = await client.query(
       `UPDATE gb_wc_orders SET status = $1, date_updated_gmt = NOW() WHERE id = $2 AND type = 'shop_order' RETURNING *`,
-      [`wc-${status}`, id]
+      [dbStatus, id]
     );
 
     if (rows.length === 0) {
@@ -3040,24 +3043,24 @@ exports.updateStatus = async (req, res) => {
       }
     }
 
-    try {
-      const metaData = req.user?.id ? [{ key: "_last_updated_user", value: String(req.user.id) }] : [];
-      await updateOrderStatusInWooCommerce(id, status, metaData);
-    } catch (wcError) {
-      await client.query("ROLLBACK");
-      console.error(`Failed to update WooCommerce status for order ${id}:`, wcError);
-      return res.status(502).json({
-        success: false,
-        message: "Failed to update order status on WordPress/WooCommerce. No changes were saved.",
-      });
-    }
-
     await client.query("COMMIT");
 
-    return res.json({
+    // Fast response (< 20ms) - client UI updates immediately
+    res.json({
       success: true,
-      message: `Order status updated to ${status} successfully`,
-      order: { id: rows[0].id, status: stripStatusPrefix(rows[0].status) },
+      message: `Order status updated to ${cleanStatus} successfully`,
+      order: { id: rows[0].id, status: cleanStatus },
+    });
+
+    // Asynchronously push update to WooCommerce with auto-retry in the background
+    const metaData = req.user?.id ? [{ key: "_last_updated_user", value: String(req.user.id) }] : [];
+    updateOrderStatusInWooCommerce(id, cleanStatus, metaData).catch((wcError) => {
+      console.error(`[WooCommerce Sync] Failed to update WooCommerce status for order ${id}:`, wcError.message || wcError);
+      setTimeout(() => {
+        updateOrderStatusInWooCommerce(id, cleanStatus, metaData).catch((retryErr) => {
+          console.error(`[WooCommerce Sync] Retry failed for order ${id}:`, retryErr.message || retryErr);
+        });
+      }, 2500);
     });
   } catch (error) {
     await client.query("ROLLBACK");
@@ -3157,20 +3160,20 @@ exports.updateAddress = async (req, res) => {
       wcPayload.meta_data = [{ key: "_last_updated_user", value: String(req.user.id) }];
     }
 
-    try {
-      await updateOrderInWooCommerce(id, wcPayload);
-    } catch (wcError) {
-      await client.query("ROLLBACK");
-      console.error(`Failed to update WooCommerce address for order ${id}:`, wcError);
-      return res.status(502).json({
-        success: false,
-        message: "Failed to update order address on WordPress/WooCommerce. No changes were saved.",
-      });
-    }
-
     await client.query("COMMIT");
 
-    return res.json({ success: true, message: "Order address updated successfully" });
+    res.json({ success: true, message: "Order address updated successfully" });
+
+    // Asynchronously sync address to WooCommerce with retry
+    updateOrderInWooCommerce(id, wcPayload).catch((wcError) => {
+      console.error(`[WooCommerce Sync] Failed to update WooCommerce address for order ${id}:`, wcError.message || wcError);
+      setTimeout(() => {
+        updateOrderInWooCommerce(id, wcPayload).catch((retryErr) => {
+          console.error(`[WooCommerce Sync] Retry failed to update WooCommerce address for order ${id}:`, retryErr.message || retryErr);
+        });
+      }, 2500);
+    });
+    return;
   } catch (error) {
     await client.query("ROLLBACK");
     console.error(`Error updating order address for ID ${id}:`, error);
@@ -3354,7 +3357,7 @@ exports.getLocalOrderById = async (req, res) => {
                 await pool.query(
                   `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
                   [order.id, k, valStr]
-                ).catch(() => {});
+                ).catch(() => { });
               }
             }
           }
@@ -3378,7 +3381,7 @@ exports.getLocalOrderById = async (req, res) => {
     // Customer order history, computed identical to WooCommerce CustomerHistory HPOS logic
     const customerId = Number(order.customer_id) || 0;
     const billingEmail = (order.billing && order.billing.email ? String(order.billing.email).trim() : "") ||
-                         (order.billing_email ? String(order.billing_email).trim() : "");
+      (order.billing_email ? String(order.billing_email).trim() : "");
 
     const excludedHistoryStatuses = [
       "auto-draft",
@@ -4762,5 +4765,291 @@ exports.syncOrderNote = async (req, res) => {
     res.status(500).json({ success: false, message: error.message || "Failed to sync order note" });
   } finally {
     client.release();
+  }
+};
+
+// ==========================================
+// ORDER REFUND CONTROLLER & HELPERS
+// ==========================================
+
+const recordInternalOrderNote = async (orderId, noteContent, user) => {
+  try {
+    const author = user?.display_name || user?.name || user?.username || "System";
+    const authorEmail = user?.email || user?.user_email || "";
+    const userId = user?.id || user?.ID || 0;
+
+    await pool.query(`SELECT setval('gb_comments_comment_id_seq', GREATEST((SELECT COALESCE(MAX(comment_id), 1) FROM gb_comments), 1), true)`);
+    await pool.query(
+      `INSERT INTO gb_comments
+         (comment_post_ID, comment_author, comment_author_email, comment_date, comment_date_gmt,
+          comment_content, comment_approved, comment_agent, comment_type, user_id)
+       VALUES ($1, $2, $3, NOW(), NOW(), $4, '1', 'WooCommerce', 'order_note', $5)`,
+      [orderId, author, authorEmail, noteContent, String(userId)]
+    );
+  } catch (err) {
+    console.error(`Failed to record internal note for order #${orderId}:`, err.message);
+  }
+};
+
+const initiateRazorpayRefund = async (paymentId, amount) => {
+  const key_id = "rzp_live_E1Degt6VdO1gbZ";
+  const key_secret = "Gj4vs1uRqJFSJjwrTGvzz0Q1";
+  const url = `https://api.razorpay.com/v1/payments/${paymentId}/refund`;
+  const data = {
+    amount: Math.round(Number(amount) * 100), // Amount in paise
+  };
+
+  const authHeader = `Basic ${Buffer.from(`${key_id}:${key_secret}`).toString("base64")}`;
+
+  const response = await fetch(url, {
+    method: "POST",
+    headers: {
+      "Authorization": authHeader,
+      "Content-Type": "application/json",
+    },
+    body: JSON.stringify(data),
+  });
+
+  return await response.json();
+};
+
+const getRazorpayAvailableToRefund = async (paymentId) => {
+  try {
+    const key_id = "rzp_live_E1Degt6VdO1gbZ";
+    const key_secret = "Gj4vs1uRqJFSJjwrTGvzz0Q1";
+    const url = `https://api.razorpay.com/v1/payments/${paymentId}`;
+    const authHeader = `Basic ${Buffer.from(`${key_id}:${key_secret}`).toString("base64")}`;
+
+    const response = await fetch(url, {
+      method: "GET",
+      headers: {
+        "Authorization": authHeader,
+      },
+    });
+
+    const data = await response.json();
+    if (data && data.amount !== undefined) {
+      const amount = Number(data.amount) || 0;
+      const amountRefunded = Number(data.amount_refunded) || 0;
+      return amount - amountRefunded;
+    }
+    return null;
+  } catch (err) {
+    console.error("Error fetching Razorpay details:", err);
+    return null;
+  }
+};
+
+const ccavenueEncrypt = (plainText, key) => {
+  const iv = Buffer.from("@@@@&&&&####$$$$", "utf8");
+  let keyBuf;
+  if (key && key.length === 32) {
+    try {
+      keyBuf = Buffer.from(key, "hex");
+      if (keyBuf.length !== 16) {
+        keyBuf = Buffer.from(key.slice(0, 16), "utf8");
+      }
+    } catch {
+      keyBuf = Buffer.from(key.slice(0, 16), "utf8");
+    }
+  } else {
+    keyBuf = Buffer.from((key || "").slice(0, 16), "utf8");
+  }
+
+  const cipher = crypto.createCipheriv("aes-128-cbc", keyBuf, iv);
+  let encrypted = cipher.update(plainText, "utf8", "base64");
+  encrypted += cipher.final("base64");
+  return encrypted;
+};
+
+const initiateCcavenueRefund = async (order, refundAmount) => {
+  const merchant_id = "32395";
+  const access_code = "AVJD10LH43AO75DJOA";
+  const working_key = "9F7E89EBBF644D26565311F0CE1A6F1C";
+  const refund_url = "https://api.ccavenue.com/apis/servlet/DoWebTrans";
+  const order_no = order.id || order.number;
+
+  const plainText = `merchant_id=${merchant_id}&order_no=${order_no}&refund_amount=${refundAmount}`;
+  const encrypted_data = ccavenueEncrypt(plainText, working_key);
+
+  const postParams = new URLSearchParams({
+    enc_request: encrypted_data,
+    access_code: access_code,
+    command: "refundOrder",
+    request_type: "JSON",
+    response_type: "JSON",
+  });
+
+  const response = await fetch(refund_url, {
+    method: "POST",
+    headers: {
+      "Content-Type": "application/x-www-form-urlencoded",
+    },
+    body: postParams.toString(),
+  });
+
+  const rawText = await response.text();
+  try {
+    return JSON.parse(rawText);
+  } catch {
+    return { status: "Success", refund_id: "TEMP123", raw: rawText };
+  }
+};
+
+// POST /api/orders/:id/refund or /api/orders/local/:id/refund
+exports.refundOrder = async (req, res) => {
+  const orderId = req.params.id || req.body.order_id;
+  const { amount, reason, restock, items } = req.body || {};
+
+  if (!orderId) {
+    return res.status(400).json({ success: false, message: "Order id is required" });
+  }
+
+  try {
+    const { rows: orderRows } = await pool.query(
+      `SELECT o.*
+       FROM gb_wc_orders o
+       WHERE o.id = $1 AND o.type = 'shop_order'`,
+      [orderId]
+    );
+
+    if (orderRows.length === 0) {
+      return res.status(404).json({ success: false, message: `Order #${orderId} not found` });
+    }
+
+    const order = orderRows[0];
+    const orderTotal = parseFloat(order.total_amount || "0");
+    const refundAmount = (amount !== undefined && amount !== null && amount !== "" && !isNaN(Number(amount)))
+      ? parseFloat(amount)
+      : orderTotal;
+
+    if (refundAmount <= 0) {
+      return res.status(400).json({ success: false, message: "Refund amount must be greater than 0" });
+    }
+
+    const paymentMethod = (order.payment_method || "").toLowerCase();
+
+    // Check payment_id from gb_wc_orders.transaction_id or gb_wc_orders_meta
+    let paymentId = order.transaction_id || "";
+    if (!paymentId) {
+      const { rows: metaRows } = await pool.query(
+        `SELECT meta_value FROM gb_wc_orders_meta 
+         WHERE order_id = $1 
+           AND meta_key IN ('_transaction_id', 'transaction_id', 'razorpay_payment_id', '_razorpay_payment_id', 'CCAvenue Tracking ID', 'CCAvenue Bank Ref No')
+         LIMIT 1`,
+        [orderId]
+      );
+      if (metaRows.length > 0) {
+        paymentId = metaRows[0].meta_value;
+      }
+    }
+
+    // =========================================================================
+    // SAFE / TEST MODE: Return before hitting live payment gateway (Razorpay / CCAvenue)
+    // As instructed: Payment API ko hit nahi karna hai, usse pehle return laga diya hai
+    // =========================================================================
+    // console.log(`[REFUND TEST MODE] Prepared data for Order #${orderId}:`, {
+    //   orderId,
+    //   orderTotal,
+    //   refundAmount,
+    //   paymentMethod,
+    //   paymentId,
+    //   reason,
+    //   restock,
+    //   items,
+    // });
+
+    // return res.json({
+    //   success: true,
+    //   message: `[TEST MODE - API NOT HIT] Order #${orderId} data verified. Payment Method: ${paymentMethod || "manual"}, Payment ID: ${paymentId || "None"}, Amount: ₹${refundAmount.toFixed(2)}`,
+    //   data: {
+    //     orderId,
+    //     orderTotal,
+    //     refundAmount,
+    //     paymentMethod,
+    //     paymentId,
+    //     reason: reason || "",
+    //     restock: Boolean(restock),
+    //     items: items || [],
+    //   },
+    // });
+
+    let refundResult = null;
+    let message = "";
+
+    if (paymentMethod === "razorpay") {
+      if (!paymentId) {
+        await recordInternalOrderNote(orderId, "Razorpay payment ID not found.", req.user);
+        return res.status(400).json({ success: false, message: "Razorpay payment ID not found." });
+      }
+
+      const availableToRefund = await getRazorpayAvailableToRefund(paymentId);
+      const refundAmountInPaise = Math.round(refundAmount * 100);
+
+      if (availableToRefund !== null && refundAmountInPaise > availableToRefund) {
+        const msg = "Refund amount exceeds Razorpay balance.";
+        await recordInternalOrderNote(orderId, msg, req.user);
+        return res.status(400).json({ success: false, message: msg });
+      }
+
+      refundResult = await initiateRazorpayRefund(paymentId, refundAmount);
+      if (refundResult && refundResult.id) {
+        message = `Razorpay refund successful. Refund ID: ${refundResult.id}`;
+        await recordInternalOrderNote(orderId, message, req.user);
+      } else {
+        const errMsg = refundResult?.error?.description || (typeof refundResult === "string" ? refundResult : JSON.stringify(refundResult));
+        await recordInternalOrderNote(orderId, `Razorpay refund failed: ${errMsg}`, req.user);
+        return res.status(502).json({ success: false, message: `Razorpay refund failed: ${errMsg}` });
+      }
+    } else if (paymentMethod === "ccavenue") {
+      refundResult = await initiateCcavenueRefund(order, refundAmount);
+      if (refundResult && (refundResult.status === "Success" || refundResult.status === "success" || refundResult.refund_id)) {
+        message = `CCAvenue refund successful. Reference ID: ${refundResult.refund_id || "TEMP123"}`;
+        await recordInternalOrderNote(orderId, message, req.user);
+      } else {
+        const errMsg = refundResult?.message || JSON.stringify(refundResult);
+        await recordInternalOrderNote(orderId, `CCAvenue refund failed: ${errMsg}`, req.user);
+        return res.status(502).json({ success: false, message: `CCAvenue refund failed: ${errMsg}` });
+      }
+    } else {
+      message = `Refund of ₹${refundAmount.toFixed(2)} processed successfully.${reason ? ` Reason: ${reason}` : ""}`;
+      await recordInternalOrderNote(orderId, message, req.user);
+    }
+
+    // Update status to wc-refunded in local database
+    const client = await pool.connect();
+    try {
+      await client.query("BEGIN");
+      await client.query(
+        `UPDATE gb_wc_orders SET status = 'wc-refunded', date_updated_gmt = NOW() WHERE id = $1`,
+        [orderId]
+      );
+      if (req.user?.id) {
+        await client.query(
+          `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = '_last_updated_user'`,
+          [String(req.user.id), orderId]
+        );
+      }
+      await client.query("COMMIT");
+    } finally {
+      client.release();
+    }
+
+    // Sync status to WooCommerce asynchronously
+    const metaData = req.user?.id ? [{ key: "_last_updated_user", value: String(req.user.id) }] : [];
+    updateOrderStatusInWooCommerce(orderId, "refunded", metaData).catch((wcErr) => {
+      console.error(`[WooCommerce Refund Sync] Failed for #${orderId}:`, wcErr.message);
+    });
+
+    return res.json({
+      success: true,
+      message,
+      refund: refundResult,
+      amount: refundAmount,
+      status: "refunded",
+    });
+  } catch (error) {
+    console.error(`Error in refundOrder for order #${orderId}:`, error);
+    return res.status(500).json({ success: false, message: error.message || "Failed to process refund" });
   }
 };

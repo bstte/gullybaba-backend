@@ -49,6 +49,8 @@ router.get("/months", authMiddleware, checkOrdersAccess, localOrderController.ge
 router.get("/", authMiddleware, checkOrdersAccess, localOrderController.getOrders);
 router.put("/:id/status", authMiddleware, checkOrdersAccess, checkEditOrderStatus, localOrderController.updateStatus);
 router.put("/:id/address", authMiddleware, checkOrdersAccess, checkEditUserDetail, localOrderController.updateAddress);
+router.post("/:id/refund", authMiddleware, checkOrdersAccess, localOrderController.refundOrder);
+router.post("/local/:id/refund", authMiddleware, checkOrdersAccess, localOrderController.refundOrder);
 
 // Called FROM WordPress when a new order is created — server-to-server, gated by a shared
 // secret (see middleware/checkWebhookSecret.js) instead of the admin-panel JWT.

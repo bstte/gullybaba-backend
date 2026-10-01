@@ -64,7 +64,8 @@ const updateOrderInWooCommerce = (id, payload) => {
         "Authorization": authHeader,
         "Content-Type": "application/json",
         "Content-Length": Buffer.byteLength(bodyData)
-      }
+      },
+      timeout: 15000
     };
 
     const req = https.request(options, (res) => {
@@ -82,6 +83,10 @@ const updateOrderInWooCommerce = (id, payload) => {
           reject(err);
         }
       });
+    });
+
+    req.on("timeout", () => {
+      req.destroy(new Error("WooCommerce request timed out after 15 seconds"));
     });
 
     req.on("error", (err) => {
