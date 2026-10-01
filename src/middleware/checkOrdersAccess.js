@@ -6,6 +6,7 @@ const { fetchCustomerById } = require("../utils/wcCustomer");
 // re-fetched from WooCommerce on every request (not read from the JWT) so a revoked access
 // takes effect immediately, without waiting for the token to expire.
 function requireOrderPermission(requiredValue, deniedMessage) {
+  const allowedKeys = Array.isArray(requiredValue) ? requiredValue : [requiredValue];
   return async (req, res, next) => {
     try {
       const customer = req.customer || (await fetchCustomerById(req.user.id));
@@ -20,7 +21,7 @@ function requireOrderPermission(requiredValue, deniedMessage) {
       const accessOrders = (customer.meta_data || []).find((m) => m.key === "access_orders");
       const values = Array.isArray(accessOrders?.value) ? accessOrders.value : [];
 
-      if (!values.includes(requiredValue)) {
+      if (!allowedKeys.some((k) => values.includes(k))) {
         return res.status(403).json({ success: false, message: deniedMessage });
       }
 
@@ -74,6 +75,10 @@ module.exports.checkOrderNote = requireOrderPermission(
 module.exports.checkDeleteNote = requireOrderPermission(
   "delete_note",
   "You do not have permission to delete order notes"
+);
+module.exports.checkRefundButton = requireOrderPermission(
+  ["refund-button", "refund_button"],
+  "You do not have permission to issue refunds"
 );
 // module.exports.checkViewOrder = requireOrderPermission(
 //   "view_order",
