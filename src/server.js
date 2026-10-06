@@ -12,6 +12,7 @@ const blogRoutes = require("./routes/blogRoutes");
 const abandonedCartRoutes = require("./routes/abandonedCartRoutes");
 const wcAbandonedCartRoutes = require("./routes/wcAbandonedCartRoutes");
 const contactFormRoutes = require("./routes/contactFormRoutes");
+const downloadRoutes = require("./routes/downloadRoutes");
 
 const app = express();
 
@@ -27,6 +28,7 @@ app.use("/api/blog", blogRoutes);
 app.use("/api/abandoned-carts", abandonedCartRoutes);
 app.use("/api/wc-abandoned-carts", wcAbandonedCartRoutes);
 app.use("/api/contact-forms", contactFormRoutes);
+app.use("/api/downloads", downloadRoutes);
 
 
 app.get("/api/health", async (req, res) => {
