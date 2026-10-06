@@ -1359,10 +1359,10 @@ async function buildOrderListPayload(orderRows) {
       display_name: updatedBy,
       updated_by_id: updatedUserId,
       billing: {
-        ...buildAddress(addr.billing, ["first_name", "last_name", "phone"]),
+        ...buildAddress(addr.billing, ["first_name", "last_name", "phone", "address_1", "address_2", "city", "state", "postcode", "country", "company"]),
         email: (addr.billing && addr.billing.email) || o.billing_email || "",
       },
-      shipping: buildAddress(addr.shipping, ["first_name", "last_name", "phone"]),
+      shipping: buildAddress(addr.shipping, ["first_name", "last_name", "phone", "address_1", "address_2", "city", "state", "postcode", "country", "company"]),
       payment_method: o.payment_method,
       payment_method_title: o.payment_method_title,
       categories: categories && categories.size > 0 ? Array.from(categories).join(", ") : "—",
