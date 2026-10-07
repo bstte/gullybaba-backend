@@ -11,7 +11,8 @@ const endpoints = {
   abandonedCarts: "/custom/v1/abandoned-carts",
   wcAbandonedCarts: "/custom/v1/wc-abandoned-carts",
   contactForms: "/custom/v1/contact-forms",
-  downloads: "/custom/v1/downloads"
+  downloads: "/custom/v1/downloads",
+  export: "/custom/v1/export"
 };
 
 // Helper function to build a complete API URL with keys appended
