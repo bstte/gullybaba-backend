@@ -1,14 +1,17 @@
 const https = require("https");
 const jwt = require("jsonwebtoken");
-const { getBasicAuthHeader } = require("../config/woocommerce");
-
-const WP_LOGIN_URL = "https://gullybababooks.in/wp-json/custom/v1/login";
+const { BASE_URL, getBasicAuthHeader } = require("../config/woocommerce");
 
 // Helper function to call the WordPress custom login endpoint
 const loginWithWordPress = (username, password) => {
   return new Promise((resolve, reject) => {
+    const siteBase = BASE_URL || process.env.BASE_URL;
+    if (!siteBase) {
+      return reject(new Error("BASE_URL is not configured in environment variables"));
+    }
+    const wpLoginUrl = `${siteBase.replace(/\/+$/, "")}/wp-json/custom/v1/login`;
     const payload = JSON.stringify({ username, password });
-    const url = new URL(WP_LOGIN_URL);
+    const url = new URL(wpLoginUrl);
 
     const options = {
       hostname: url.hostname,

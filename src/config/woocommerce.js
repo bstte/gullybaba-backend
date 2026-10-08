@@ -1,6 +1,20 @@
-const WOOCOMMERCE_BASE_URL = process.env.WOOCOMMERCE_BASE_URL;
-const CONSUMER_KEY = process.env.WOOCOMMERCE_CONSUMER_KEY;
-const CONSUMER_SECRET = process.env.WOOCOMMERCE_CONSUMER_SECRET;
+const rawBaseUrl =
+  process.env.BASE_URL ||
+  process.env.WP_BASE_URL ||
+  (process.env.WOOCOMMERCE_BASE_URL
+    ? process.env.WOOCOMMERCE_BASE_URL.replace(/\/wp-json\/?$/, "")
+    : "");
+
+const BASE_URL = (rawBaseUrl || "").replace(/\/+$/, "");
+
+const WOOCOMMERCE_BASE_URL = (
+  process.env.BASE_URL
+    ? `${BASE_URL}/wp-json`
+    : (process.env.WOOCOMMERCE_BASE_URL || (BASE_URL ? `${BASE_URL}/wp-json` : ""))
+).replace(/\/+$/, "");
+
+const CONSUMER_KEY = process.env.WOOCOMMERCE_CONSUMER_KEY || "";
+const CONSUMER_SECRET = process.env.WOOCOMMERCE_CONSUMER_SECRET || "";
 
 const endpoints = {
   customers: "/wc/v3/customers",
@@ -26,8 +40,8 @@ const getApiUrl = (endpointKey, queryParams = {}, resourceId = null) => {
   const urlObj = new URL(`${WOOCOMMERCE_BASE_URL}${fullPath}`);
   
   // Append consumer key and secret automatically
-  urlObj.searchParams.append("consumer_key", CONSUMER_KEY);
-  urlObj.searchParams.append("consumer_secret", CONSUMER_SECRET);
+  if (CONSUMER_KEY) urlObj.searchParams.append("consumer_key", CONSUMER_KEY);
+  if (CONSUMER_SECRET) urlObj.searchParams.append("consumer_secret", CONSUMER_SECRET);
 
   // Append other query params
   Object.entries(queryParams).forEach(([key, val]) => {
@@ -41,11 +55,12 @@ const getApiUrl = (endpointKey, queryParams = {}, resourceId = null) => {
 
 // Helper function to retrieve the server-level Basic Auth bypass header
 const getBasicAuthHeader = () => {
-  const authString = "gullybaba:Gullybaba@2026";
+  const authString = process.env.WP_BASIC_AUTH || "gullybaba:Gullybaba@2026";
   return `Basic ${Buffer.from(authString).toString("base64")}`;
 };
 
 module.exports = {
+  BASE_URL,
   WOOCOMMERCE_BASE_URL,
   CONSUMER_KEY,
   CONSUMER_SECRET,

@@ -2,7 +2,14 @@ const https = require("https");
 const crypto = require("crypto");
 const pool = require("../config/database");
 const { updateOrderStatusInWooCommerce, updateOrderInWooCommerce } = require("./orderController");
-const { getApiUrl, getBasicAuthHeader } = require("../config/woocommerce");
+const {
+  BASE_URL,
+  WOOCOMMERCE_BASE_URL,
+  CONSUMER_KEY,
+  CONSUMER_SECRET,
+  getApiUrl,
+  getBasicAuthHeader,
+} = require("../config/woocommerce");
 const { fetchCustomerById } = require("../utils/wcCustomer");
 
 // Fetch product thumbnail images and details from the live WooCommerce API, keyed by product id
@@ -3489,9 +3496,10 @@ exports.getLocalOrderById = async (req, res) => {
 exports.getOrderDownloads = async (req, res) => {
   const { id } = req.params;
   try {
-    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
-    const url = `https://gullybababooks.in/wp-json/custom/v1/orders/${id}/downloads?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+    const consumerKey = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const consumerSecret = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    const wcBaseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const url = `${wcBaseUrl}/custom/v1/orders/${id}/downloads?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
 
     const data = await wcGetJson(url);
     if (!data) {
@@ -3517,9 +3525,10 @@ exports.searchDownloadableProducts = async (req, res) => {
   }
 
   try {
-    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
-    const url = `https://gullybababooks.in/wp-json/custom/v1/downloadable-products?search=${encodeURIComponent(search.trim())}&consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+    const consumerKey = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const consumerSecret = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    const wcBaseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const url = `${wcBaseUrl}/custom/v1/downloadable-products?search=${encodeURIComponent(search.trim())}&consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
 
     const data = await wcGetJson(url);
     if (!data) {
@@ -3553,9 +3562,10 @@ exports.grantOrderDownloadAccess = async (req, res) => {
   }
 
   try {
-    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
-    const baseUrl = `https://gullybababooks.in/wp-json/custom/v1/orders/${id}/downloads/grant?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+    const consumerKey = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const consumerSecret = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    const wcBaseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const baseUrl = `${wcBaseUrl}/custom/v1/orders/${id}/downloads/grant?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
 
     const grantedResults = [];
     const errors = [];
@@ -3608,9 +3618,10 @@ exports.revokeOrderDownloadAccess = async (req, res) => {
   }
 
   try {
-    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
-    const url = `https://gullybababooks.in/wp-json/custom/v1/orders/${id}/downloads/revoke?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+    const consumerKey = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const consumerSecret = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    const wcBaseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const url = `${wcBaseUrl}/custom/v1/orders/${id}/downloads/revoke?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
 
     const payload = {};
     if (permission_id) payload.permission_id = Number(permission_id);
@@ -3645,10 +3656,11 @@ exports.getOrderDownloadLogs = async (req, res) => {
   const orderId = id || req.query.order_id;
 
   try {
-    const consumerKey = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const consumerSecret = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const consumerKey = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const consumerSecret = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    const wcBaseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
 
-    let url = `https://gullybababooks.in/wp-json/custom/v1/orders/${orderId}/downloads/logs?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+    let url = `${wcBaseUrl}/custom/v1/orders/${orderId}/downloads/logs?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
     if (permissionId) {
       url += `&permission_id=${encodeURIComponent(permissionId)}`;
     }
@@ -4075,7 +4087,8 @@ exports.sendToDtdc = async (req, res) => {
 
     // 1. Primary path: Dispatch via WordPress order-send-to-dtdc ajax endpoint
     try {
-      const wpAjaxUrl = "https://gullybababooks.in/wp-admin/admin-ajax.php";
+      const siteBase = (BASE_URL || process.env.BASE_URL || "").replace(/\/+$/, "");
+      const wpAjaxUrl = `${siteBase}/wp-admin/admin-ajax.php`;
       const formData = new URLSearchParams({
         action: "send_to_dtdc",
         order_id: String(order.id),
@@ -4403,9 +4416,9 @@ exports.getOrderNotes = async (req, res) => {
 // Helper to post an order note to WooCommerce REST API (/wc/v2/orders/:id/notes)
 const sendOrderNoteToWooCommerce = (orderId, notePayload) => {
   return new Promise((resolve) => {
-    const baseUrl = process.env.WOOCOMMERCE_BASE_URL || "https://gullybababooks.in/wp-json";
-    const ck = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const cs = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const baseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const ck = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const cs = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
     const postUrl = `${baseUrl}/wc/v2/orders/${orderId}/notes?consumer_key=${ck}&consumer_secret=${cs}`;
 
     const parsedUrl = new URL(postUrl);
@@ -4458,9 +4471,9 @@ const sendOrderNoteToWooCommerce = (orderId, notePayload) => {
 // Helper to delete an order note from WooCommerce REST API (/wc/v2/orders/:id/notes/:noteId)
 const deleteOrderNoteFromWooCommerce = (orderId, noteId) => {
   return new Promise((resolve) => {
-    const baseUrl = process.env.WOOCOMMERCE_BASE_URL || "https://gullybababooks.in/wp-json";
-    const ck = process.env.WOOCOMMERCE_CONSUMER_KEY || "ck_4a4a35a6115395e1514cdd63cc40ec6f3c1970f2";
-    const cs = process.env.WOOCOMMERCE_CONSUMER_SECRET || "cs_c3dc056e368ae43104ffe418e55b016e527c003e";
+    const baseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const ck = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const cs = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
     const deleteUrl = `${baseUrl}/wc/v2/orders/${orderId}/notes/${noteId}?force=true&consumer_key=${ck}&consumer_secret=${cs}`;
 
     const parsedUrl = new URL(deleteUrl);
