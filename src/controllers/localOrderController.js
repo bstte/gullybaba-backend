@@ -4257,6 +4257,29 @@ exports.fetchTekipostStatus = async (req, res) => {
       putReq.end();
     });
 
+    try {
+      for (const [mk, mv] of [
+        ["_tekipost_awb", trackingDetails.tracking_number],
+        ["_tekipost_courier_name", trackingDetails.courier_name],
+        ["_tekipost_c_status", trackingDetails.tracking_statuses],
+      ]) {
+        if (mv) {
+          const updRes = await pool.query(
+            `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = $3`,
+            [String(mv), order.id, mk]
+          );
+          if (updRes.rowCount === 0) {
+            await pool.query(
+              `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+              [order.id, mk, String(mv)]
+            );
+          }
+        }
+      }
+    } catch (pgErr) {
+      console.error(`[tekipost-status] failed to persist meta to pg for order #${order.id}:`, pgErr);
+    }
+
     console.log(`[tekipost-status] order #${order.id} tracking details:`, trackingDetails);
     return res.json({ success: true, ...trackingDetails });
   } catch (error) {
@@ -4333,6 +4356,31 @@ exports.fetchShiprocketStatus = async (req, res) => {
       }));
       putReq.end();
     });
+
+    try {
+      for (const [mk, mv] of [
+        ["_shiprocket_awb", trackingDetails.awb_code],
+        ["_shiprocket_pickup_date", trackingDetails.pickup_date],
+        ["_shiprocket_current_status", trackingDetails.current_status],
+        ["_shiprocket_courier_name", trackingDetails.courier_name],
+        ["_shiprocket_edd", trackingDetails.edd],
+      ]) {
+        if (mv) {
+          const updRes = await pool.query(
+            `UPDATE gb_wc_orders_meta SET meta_value = $1 WHERE order_id = $2 AND meta_key = $3`,
+            [String(mv), order.id, mk]
+          );
+          if (updRes.rowCount === 0) {
+            await pool.query(
+              `INSERT INTO gb_wc_orders_meta (order_id, meta_key, meta_value) VALUES ($1, $2, $3)`,
+              [order.id, mk, String(mv)]
+            );
+          }
+        }
+      }
+    } catch (pgErr) {
+      console.error(`[shiprocket-status] failed to persist meta to pg for order #${order.id}:`, pgErr);
+    }
 
     console.log(`[shiprocket-status] order #${order.id} tracking details:`, trackingDetails);
     return res.json({ success: true, ...trackingDetails });
