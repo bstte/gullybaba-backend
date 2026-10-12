@@ -9,7 +9,9 @@ const {
   checkEditUserDetail,
   checkEditOrderStatus,
   checkSendToShiprocket,
+  checkShiprocketTracking,
   checkSendToTekipost,
+  checkTekipostTracking,
   checkSendToDtdc,
   checkOrderWeight,
   checkOrderNote,
@@ -33,8 +35,8 @@ router.post("/local/:id/tekipost-preview", authMiddleware, checkOrdersAccess, ch
 router.post("/local/:id/shiprocket-preview", authMiddleware, checkOrdersAccess, checkSendToShiprocket, localOrderController.previewShiprocket);
 router.post("/local/:id/dtdc-send", authMiddleware, checkOrdersAccess, checkSendToDtdc, localOrderController.sendToDtdc);
 router.post("/local/:id/dtdc-preview", authMiddleware, checkOrdersAccess, checkSendToDtdc, localOrderController.sendToDtdc);
-router.get("/local/:id/tekipost-status", authMiddleware, checkOrdersAccess, localOrderController.fetchTekipostStatus);
-router.get("/local/:id/shiprocket-status", authMiddleware, checkOrdersAccess, localOrderController.fetchShiprocketStatus);
+router.get("/local/:id/tekipost-status", authMiddleware, checkOrdersAccess, checkTekipostTracking, localOrderController.fetchTekipostStatus);
+router.get("/local/:id/shiprocket-status", authMiddleware, checkOrdersAccess, checkShiprocketTracking, localOrderController.fetchShiprocketStatus);
 router.get("/local/:id/notes", authMiddleware, checkOrdersAccess, checkOrderNote, localOrderController.getOrderNotes);
 router.post("/local/:id/notes", authMiddleware, checkOrdersAccess, checkOrderNote, localOrderController.addOrderNote);
 router.delete("/local/:id/notes/:noteId", authMiddleware, checkOrdersAccess, checkDeleteNote, localOrderController.deleteOrderNote);

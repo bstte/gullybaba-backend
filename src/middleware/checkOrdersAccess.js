@@ -80,6 +80,14 @@ module.exports.checkRefundButton = requireOrderPermission(
   ["refund-button", "refund_button"],
   "You do not have permission to issue refunds"
 );
+module.exports.checkShiprocketTracking = requireOrderPermission(
+  "shiprocket_tracking",
+  "You do not have permission to view Shiprocket tracking status"
+);
+module.exports.checkTekipostTracking = requireOrderPermission(
+  "tekipost_tracking",
+  "You do not have permission to view TekiPost tracking status"
+);
 // module.exports.checkViewOrder = requireOrderPermission(
 //   "view_order",
 //   "You do not have permission to view this order"
