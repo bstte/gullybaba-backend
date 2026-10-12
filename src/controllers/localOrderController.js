@@ -4197,11 +4197,20 @@ exports.previewDtdc = exports.sendToDtdc;
 // Ports get_tekipost_token() + fetch_tekipost_tracking_details() + save_tekipost_tracking_to_order().
 exports.fetchTekipostStatus = async (req, res) => {
   try {
-    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    let rows = await fetchOrderRows("id = $1", [req.params.id]);
     if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Order not found" });
+      try {
+        const wcOrder = await wcGetJson(getApiUrl("orders", {}, req.params.id));
+        if (wcOrder && wcOrder.id) {
+          await new Promise((resolve) => {
+            const fakeRes = { status: () => fakeRes, json: resolve };
+            exports.createOrder({ body: wcOrder }, fakeRes).catch(() => resolve());
+          });
+          rows = await fetchOrderRows("id = $1", [req.params.id]);
+        }
+      } catch (err) {}
     }
-    const [order] = await buildOrdersPayload(rows);
+    const order = rows.length > 0 ? (await buildOrdersPayload(rows))[0] : { id: req.params.id, meta_data: [] };
 
     const loginRes = await httpJsonRequest("https://app.tekipost.com/api-login", {
       headers: { "Content-Type": "application/json" },
@@ -4292,11 +4301,20 @@ exports.fetchTekipostStatus = async (req, res) => {
 // Ports the WordPress get_shiprocket_detail_button() + fetch_shiprocket_tracking_details() + save_shiprocket_tracking_to_order() flow.
 exports.fetchShiprocketStatus = async (req, res) => {
   try {
-    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    let rows = await fetchOrderRows("id = $1", [req.params.id]);
     if (rows.length === 0) {
-      return res.status(404).json({ success: false, message: "Order not found" });
+      try {
+        const wcOrder = await wcGetJson(getApiUrl("orders", {}, req.params.id));
+        if (wcOrder && wcOrder.id) {
+          await new Promise((resolve) => {
+            const fakeRes = { status: () => fakeRes, json: resolve };
+            exports.createOrder({ body: wcOrder }, fakeRes).catch(() => resolve());
+          });
+          rows = await fetchOrderRows("id = $1", [req.params.id]);
+        }
+      } catch (err) {}
     }
-    const [order] = await buildOrdersPayload(rows);
+    const order = rows.length > 0 ? (await buildOrdersPayload(rows))[0] : { id: req.params.id, meta_data: [] };
 
     const loginRes = await httpJsonRequest("https://apiv2.shiprocket.in/v1/external/auth/login", {
       headers: { "Content-Type": "application/json" },
@@ -4305,37 +4323,59 @@ exports.fetchShiprocketStatus = async (req, res) => {
     const token = loginRes.json?.token;
     if (!token) throw new Error("Unable to authenticate with Shiprocket.");
 
-    // Step 1: order lookup by WooCommerce order id -> shipment (AWB + courier)
-    const orderRes = await httpJsonRequest(`https://apiv2.shiprocket.in/v1/external/orders/show/${order.id}`, {
+    // Step 1: Track order in Shiprocket using order_id with _gb suffix and channel_id 417905 (mirrors WordPress plugin)
+    let trackUrl = `https://apiv2.shiprocket.in/v1/external/courier/track?order_id=${order.id}_gb&channel_id=417905`;
+    let trackRes = await httpJsonRequest(trackUrl, {
       method: "GET",
       headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
     });
-    if (!orderRes.json) {
-      console.error(`[shiprocket-status] order #${order.id} non-JSON order lookup response:`, orderRes.statusCode, orderRes.raw);
-      throw new Error("Shiprocket returned an unexpected response for the order lookup.");
+
+    let shipmentData = trackRes.json?.[0]?.tracking_data?.shipment_track?.[0]
+      || trackRes.json?.tracking_data?.shipment_track?.[0];
+    let publicTrackUrl = trackRes.json?.[0]?.tracking_data?.track_url
+      || trackRes.json?.tracking_data?.track_url
+      || "";
+
+    // Fallback 1: Try without _gb suffix if not found
+    if (!shipmentData) {
+      const fallbackUrl = `https://apiv2.shiprocket.in/v1/external/courier/track?order_id=${order.id}&channel_id=417905`;
+      const fallbackRes = await httpJsonRequest(fallbackUrl, {
+        method: "GET",
+        headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+      });
+      if (fallbackRes.json?.[0]?.tracking_data?.shipment_track?.[0]) {
+        shipmentData = fallbackRes.json[0].tracking_data.shipment_track[0];
+        publicTrackUrl = fallbackRes.json[0].tracking_data.track_url || publicTrackUrl;
+      }
     }
-    const shipment = orderRes.json?.data?.shipments?.[0] || {};
-    const awbCode = shipment.awb || "";
+
+    // Fallback 2: Try tracking by existing AWB if already saved in meta
+    if (!shipmentData) {
+      const existingAwb = order.meta_data?.find((m) => m.key === "_shiprocket_awb" || m.key === "_shiprocket_awb_code")?.value;
+      if (existingAwb) {
+        const awbTrackRes = await httpJsonRequest(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${existingAwb}`, {
+          method: "GET",
+          headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
+        });
+        shipmentData = awbTrackRes.json?.tracking_data?.shipment_track?.[0];
+        publicTrackUrl = awbTrackRes.json?.tracking_data?.track_url || publicTrackUrl;
+      }
+    }
+
+    const awbCode = shipmentData?.awb_code || "";
     if (!awbCode) {
-      // Expected right after an order is placed: Shiprocket hasn't assigned an AWB/picked it up yet.
       const err = new Error("No AWB code available yet — order is still pending pickup at Shiprocket.");
       err.statusCode = 409;
       throw err;
     }
 
-    // Step 2: track by AWB -> current status, pickup date, EDD
-    const trackRes = await httpJsonRequest(`https://apiv2.shiprocket.in/v1/external/courier/track/awb/${awbCode}`, {
-      method: "GET",
-      headers: { "Authorization": `Bearer ${token}`, "Content-Type": "application/json" },
-    });
-    const shipmentTrack = trackRes.json?.tracking_data?.shipment_track?.[0] || {};
-
     const trackingDetails = {
       awb_code: awbCode,
-      pickup_date: shipmentTrack.pickup_date || "",
-      current_status: shipmentTrack.current_status || "",
-      courier_name: shipment.courier || shipmentTrack.courier_name || "",
-      edd: shipmentTrack.edd || "",
+      pickup_date: shipmentData.pickup_date || "",
+      current_status: shipmentData.current_status || "",
+      courier_name: shipmentData.courier_name || "",
+      edd: shipmentData.edd || "",
+      track_url: publicTrackUrl || `https://Gullybaba.shiprocket.co/tracking/${awbCode}`,
     };
 
     // Save back to the order — mirrors $order->update_meta_data(...)->save() via the WC REST API.
