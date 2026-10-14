@@ -3649,6 +3649,50 @@ exports.revokeOrderDownloadAccess = async (req, res) => {
   }
 };
 
+// POST /api/orders/local/:id/downloads/update — update downloadable permissions (downloads_remaining, access_expires)
+exports.updateOrderDownloadPermissions = async (req, res) => {
+  const { id } = req.params;
+  const { permissions, permission_id, downloads_remaining, access_expires } = req.body;
+
+  let targetPermissions = [];
+  if (Array.isArray(permissions)) {
+    targetPermissions = permissions;
+  } else if (permission_id) {
+    targetPermissions = [{ permission_id, downloads_remaining, access_expires }];
+  }
+
+  if (targetPermissions.length === 0) {
+    return res.status(400).json({ success: false, message: "No permissions data provided to update" });
+  }
+
+  try {
+    const consumerKey = CONSUMER_KEY || process.env.WOOCOMMERCE_CONSUMER_KEY;
+    const consumerSecret = CONSUMER_SECRET || process.env.WOOCOMMERCE_CONSUMER_SECRET;
+    const wcBaseUrl = WOOCOMMERCE_BASE_URL || process.env.WOOCOMMERCE_BASE_URL;
+    const url = `${wcBaseUrl}/custom/v1/orders/${id}/downloads/update?consumer_key=${consumerKey}&consumer_secret=${consumerSecret}`;
+
+    const payload = { permissions: targetPermissions };
+    const result = await wcPostJson(url, payload);
+
+    if (result.statusCode >= 200 && result.statusCode < 300 && result.data && result.data.success) {
+      return res.json({
+        success: true,
+        message: result.data.message || "Download permissions updated successfully",
+        order_id: Number(id),
+      });
+    }
+
+    const errMsg = (result.data && (result.data.message || result.data.code)) || result.error || `HTTP ${result.statusCode}`;
+    return res.status(result.statusCode >= 400 && result.statusCode < 500 ? result.statusCode : 400).json({
+      success: false,
+      message: errMsg,
+    });
+  } catch (error) {
+    console.error(`Error updating download permissions for order ${id}:`, error);
+    return res.status(500).json({ success: false, message: "Internal server error while updating download permissions" });
+  }
+};
+
 // GET /api/orders/local/:id/downloads/logs — fetch customer download logs
 exports.getOrderDownloadLogs = async (req, res) => {
   const { id } = req.params;

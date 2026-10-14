@@ -28,6 +28,8 @@ router.post("/local/:id/downloads/grant", authMiddleware, checkOrdersAccess, loc
 router.post("/:id/downloads/grant", authMiddleware, checkOrdersAccess, localOrderController.grantOrderDownloadAccess);
 router.post("/local/:id/downloads/revoke", authMiddleware, checkOrdersAccess, localOrderController.revokeOrderDownloadAccess);
 router.post("/:id/downloads/revoke", authMiddleware, checkOrdersAccess, localOrderController.revokeOrderDownloadAccess);
+router.post("/local/:id/downloads/update", authMiddleware, checkOrdersAccess, localOrderController.updateOrderDownloadPermissions);
+router.post("/:id/downloads/update", authMiddleware, checkOrdersAccess, localOrderController.updateOrderDownloadPermissions);
 router.get("/local/:id/downloads/logs", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloadLogs);
 router.get("/:id/downloads/logs", authMiddleware, checkOrdersAccess, localOrderController.getOrderDownloadLogs);
 router.get("/local/:id/weight", authMiddleware, checkOrdersAccess, checkOrderWeight, localOrderController.getOrderWeight);
