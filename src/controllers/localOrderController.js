@@ -2597,8 +2597,8 @@ exports.updateOrder = async (req, res) => {
     }
 
     // 6. Push to WooCommerce if initiated by admin / client from CRM
+    let wcPayload = {};
     if (shouldSyncToWordPress) {
-      const wcPayload = {};
       if (newStatus) wcPayload.status = stripStatusPrefix(newStatus);
       if (billingAddress) wcPayload.billing = billingAddress;
       if (shippingAddress) wcPayload.shipping = shippingAddress;
