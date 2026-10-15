@@ -166,6 +166,52 @@ const orderItemMetaValue = (lineItem, key) => {
   return entry ? entry.value : null;
 };
 
+const extractBundleItems = (product, lineItem) => {
+  // 1. Line item meta: '_woosb_ids' (e.g. "6419/t9b9/1/,6429/beu8/1/...")
+  const lineItemWoosb = lineItem?.meta_data?.find((m) => m.key === "_woosb_ids")?.value;
+  if (typeof lineItemWoosb === "string" && lineItemWoosb.trim()) {
+    const parts = lineItemWoosb.split(",").map((p) => p.trim()).filter(Boolean);
+    const items = [];
+    for (const part of parts) {
+      const segs = part.split("/").map((s) => s.trim());
+      const pid = parseInt(segs[0], 10);
+      const qty = parseInt(segs[2], 10) || 1;
+      if (pid) items.push({ id: pid, qty });
+    }
+    if (items.length > 0) return items;
+  }
+
+  // 2. Product meta: 'woosb_ids'
+  const productWoosb = productMetaValue(product, "woosb_ids");
+  if (productWoosb) {
+    if (typeof productWoosb === "object" && !Array.isArray(productWoosb)) {
+      const items = [];
+      for (const val of Object.values(productWoosb)) {
+        if (typeof val === "object" && val !== null && val.id) {
+          items.push({ id: parseInt(val.id, 10), qty: parseInt(val.qty, 10) || 1 });
+        } else if (typeof val === "string" || typeof val === "number") {
+          const pid = parseInt(val, 10);
+          if (pid) items.push({ id: pid, qty: 1 });
+        }
+      }
+      if (items.length > 0) return items;
+    }
+    if (typeof productWoosb === "string") {
+      const parts = productWoosb.split(",").map((s) => s.trim()).filter(Boolean);
+      const items = [];
+      for (const part of parts) {
+        const segs = part.split("/").map((s) => s.trim());
+        const pid = parseInt(segs[0], 10);
+        const qty = segs.length > 2 ? parseInt(segs[2], 10) || 1 : 1;
+        if (pid) items.push({ id: pid, qty });
+      }
+      if (items.length > 0) return items;
+    }
+  }
+
+  return [];
+};
+
 // Ports the WordPress "$total_weight" calculation (Weight (kg) field on the order page).
 // Returns { total_weight, warnings } — warnings lists line items we couldn't fully resolve.
 async function computeOrderWeight(order) {
@@ -197,18 +243,18 @@ async function computeOrderWeight(order) {
       const weight = parseFloat(product.weight || 0) + 0.015;
       totalWeight += weight * li.quantity;
     } else if (product.type === "woosb") {
-      const bundleIdsRaw = productMetaValue(product, "woosb_ids");
-      if (!bundleIdsRaw) {
-        warnings.push(`Bundle product #${li.product_id} (${li.name}) has no "woosb_ids" meta — bundle weight NOT included (unverified field, no woosb order was available to confirm the real meta key/shape).`);
+      const bundleItems = extractBundleItems(product, li);
+      if (bundleItems.length === 0) {
+        warnings.push(`Bundle product #${li.product_id} (${li.name}) has no bundle items metadata — bundle weight NOT included.`);
         continue;
       }
-      const bundleIds = bundleIdsRaw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+      const bundleIds = bundleItems.map((b) => b.id);
       const bundleMap = await fetchProductsBulk(bundleIds);
-      bundleIds.forEach((bid) => {
-        const bp = bundleMap[bid];
+      bundleItems.forEach((b) => {
+        const bp = bundleMap[b.id];
         if (!bp) return;
         const weight = parseFloat(bp.weight || 0) + 0.015;
-        totalWeight += weight * li.quantity;
+        totalWeight += weight * (b.qty || 1) * li.quantity;
       });
     } else {
       warnings.push(`Product #${li.product_id} (${li.name}) has unhandled type "${product.type}" — excluded from weight.`);
@@ -411,13 +457,13 @@ async function buildShiprocketPreview(order) {
         warnings.push(
           `Bundle product #${li.product_id} (${li.name}) — woosb bundle expansion is unverified (no woosb order available to confirm the "woosb_ids" meta shape). The WordPress code also resets total pages/weight/height to just this bundle's items at this point (a quirk of the original code, ported as-is) — treat these numbers with caution.`
         );
-        const bundleIdsRaw = productMetaValue(product, "woosb_ids");
+        const bundleItems = extractBundleItems(product, li);
         sku_reset: {
-          if (!bundleIdsRaw) {
-            warnings.push(`Bundle product #${li.product_id} has no "woosb_ids" meta — bundle contents skipped, item still listed.`);
+          if (!bundleItems.length) {
+            warnings.push(`Bundle product #${li.product_id} has no bundle items meta — bundle contents skipped, item still listed.`);
             break sku_reset;
           }
-          const bundleIds = bundleIdsRaw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+          const bundleIds = bundleItems.map((b) => b.id);
           const bundleMap = await fetchProductsBulk(bundleIds);
           totalPages = 0;
           totalWeight = 0;
@@ -425,14 +471,14 @@ async function buildShiprocketPreview(order) {
           itemQuantity = 0;
           const languageRaw = orderItemMetaValue(li, "Medium");
           const itemLanguage = languageRaw ? languageRaw.split("-")[0].toLowerCase() : null;
-          bundleIds.forEach((bid) => {
-            const bp = bundleMap[bid];
+          bundleItems.forEach((b) => {
+            const bp = bundleMap[b.id];
             if (!bp) return;
             const pageCount = itemLanguage ? parseInt(productMetaValue(bp, `pages_${itemLanguage}`), 10) || 0 : 0;
-            totalPages += pageCount * li.quantity;
+            totalPages += pageCount * (b.qty || 1) * li.quantity;
             const weight = parseFloat(bp.weight || 0) + 0.015;
-            totalWeight += weight * li.quantity;
-            itemQuantity = li.quantity;
+            totalWeight += weight * (b.qty || 1) * li.quantity;
+            itemQuantity += (b.qty || 1) * li.quantity;
           });
           height = (totalPages / 25) * 0.1;
           name = languageRaw ? `${li.name} - ${languageRaw} (${sku})` : li.name;
@@ -565,23 +611,24 @@ async function buildDtdcPayload(order, customWeight = null) {
     }
 
     if (product.type === "woosb") {
-      const bundleIdsRaw = productMetaValue(product, "woosb_ids");
-      if (bundleIdsRaw) {
-        const bundleIds = bundleIdsRaw.split(",").map((s) => parseInt(s.trim(), 10)).filter(Boolean);
+      const bundleItems = extractBundleItems(product, li);
+      if (bundleItems.length > 0) {
+        const bundleIds = bundleItems.map((b) => b.id);
         const bundleMap = await fetchProductsBulk(bundleIds);
-        const childCount = bundleIds.length;
+        const childCount = bundleItems.reduce((acc, b) => acc + (b.qty || 1), 0);
         const totalLinePcs = quantity * childCount;
         const perPieceVal = totalLinePcs > 0 ? (itemTotal / totalLinePcs).toFixed(2) : itemTotal.toFixed(2);
 
-        bundleIds.forEach((bid) => {
-          const bp = bundleMap[bid];
+        bundleItems.forEach((item) => {
+          const bp = bundleMap[item.id];
           if (!bp) return;
           const childWeight = parseFloat(bp.weight || 0) + weightAddon;
           const childLength = parseFloat(bp.length) || 10;
           const childWidth = parseFloat(bp.width) || 10;
           const childHeight = parseFloat(bp.height) || 10;
+          const itemQty = (item.qty || 1) * quantity;
 
-          for (let i = 0; i < quantity; i++) {
+          for (let i = 0; i < itemQty; i++) {
             pieces_detail.push({
               description: commodity,
               declared_value: perPieceVal,
@@ -592,10 +639,10 @@ async function buildDtdcPayload(order, customWeight = null) {
             });
             totalPieces++;
           }
-          totalWeight += childWeight * quantity;
+          totalWeight += childWeight * itemQty;
         });
       } else {
-        warnings.push(`Bundle product #${li.product_id} (${li.name}) has no woosb_ids; using fallback dimensions.`);
+        warnings.push(`Bundle product #${li.product_id} (${li.name}) has no bundle items meta; using fallback dimensions.`);
         for (let i = 0; i < quantity; i++) {
           pieces_detail.push({
             description: commodity,
@@ -3736,7 +3783,21 @@ exports.getOrderDownloadLogs = async (req, res) => {
 // GET /api/orders/local/:id/weight — ported from the WordPress "Weight (kg)" calculation
 exports.getOrderWeight = async (req, res) => {
   try {
-    const rows = await fetchOrderRows("id = $1", [req.params.id]);
+    let rows = await fetchOrderRows("id = $1", [req.params.id]);
+    if (rows.length === 0) {
+      try {
+        const wcOrder = await wcGetJson(getApiUrl("orders", {}, req.params.id));
+        if (wcOrder && wcOrder.id) {
+          await new Promise((resolve) => {
+            const fakeRes = { status: () => fakeRes, json: resolve };
+            exports.createOrder({ body: wcOrder }, fakeRes).catch(() => resolve());
+          });
+          rows = await fetchOrderRows("id = $1", [req.params.id]);
+        }
+      } catch (err) {
+        // Fall through
+      }
+    }
     if (rows.length === 0) {
       return res.status(404).json({ success: false, message: "Order not found" });
     }
