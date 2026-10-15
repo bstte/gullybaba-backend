@@ -88,6 +88,10 @@ module.exports.checkTekipostTracking = requireOrderPermission(
   "tekipost_tracking",
   "You do not have permission to view TekiPost tracking status"
 );
+module.exports.checkDtdcTracking = requireOrderPermission(
+  "dtdc_tracking",
+  "You do not have permission to view DTDC tracking status"
+);
 // module.exports.checkViewOrder = requireOrderPermission(
 //   "view_order",
 //   "You do not have permission to view this order"
